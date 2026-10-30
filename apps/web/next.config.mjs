@@ -38,6 +38,9 @@ const BUILD_STAMP = (
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
+  // No `x-powered-by: Next.js` on every response: framework fingerprinting for
+  // exploit scanners, no functional benefit.
+  poweredByHeader: false,
   generateBuildId: () => BUILD_STAMP,
   env: {
     NEXT_PUBLIC_API_URL: process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000',

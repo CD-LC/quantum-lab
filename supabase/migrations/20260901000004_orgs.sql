@@ -377,14 +377,12 @@ create policy org_invites_insert_manager
 drop policy if exists org_invites_update_manager on public.org_invites;
 create policy org_invites_update_manager
   on public.org_invites for update
-  using (
-    public.is_org_manager(org_id)
-    or lower(email) = lower(coalesce(auth.jwt() ->> 'email', ''))
-  )
-  with check (
-    public.is_org_manager(org_id)
-    or lower(email) = lower(coalesce(auth.jwt() ->> 'email', ''))
-  );
+  using (public.is_org_manager(org_id))
+  with check (public.is_org_manager(org_id));
+-- Managers only (audit 2026-10-22). The invitee used to be allowed to UPDATE
+-- their own row, which let them rewrite org_id / role / expires_at /
+-- accepted_at; the accept route trusts those columns. The invitee never needs
+-- UPDATE: the server burns the invite with the service role.
 
 drop policy if exists org_invites_delete_manager on public.org_invites;
 create policy org_invites_delete_manager

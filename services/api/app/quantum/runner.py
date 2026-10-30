@@ -15,7 +15,12 @@ from qiskit import QuantumCircuit, transpile
 
 from app.core.config import settings
 from app.quantum.backends import BackendInfo, get_backend
-from app.quantum.limits import MAX_NOISY_QUBITS, MAX_STATEVECTOR_QUBITS
+from app.quantum.limits import (
+    MAX_EXPANDED_OPERATIONS,
+    MAX_NOISY_QUBITS,
+    MAX_PARSED_QUBITS,
+    MAX_STATEVECTOR_QUBITS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -172,7 +177,7 @@ def parse_qasm(qasm: str) -> QuantumCircuit:
     errors: list[str] = []
     for label, parser in parsers:
         try:
-            return parser(qasm)
+            circuit = parser(qasm)
         # Qiskit's native importer surfaces Rust panics as PanicException, which
         # derives from BaseException, so a bare `except Exception` would let it
         # escape and take down the request.
@@ -180,8 +185,90 @@ def parse_qasm(qasm: str) -> QuantumCircuit:
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 raise
             errors.append(f"{label}: {exc}")
+            continue
+        # Outside the try: a refusal here is final, not a reason to try the next
+        # parser.
+        assert_parsed_circuit_is_affordable(circuit)
+        return circuit
 
     raise ValueError(f"Could not parse the circuit: {'; '.join(errors)}")
+
+
+def expanded_operation_count(circuit: QuantumCircuit, cap: int = MAX_EXPANDED_OPERATIONS) -> int:
+    """Count the primitive operations a circuit expands to, stopping past ``cap``.
+
+    OpenQASM 3 ``gate`` definitions may call other definitions, and Qiskit keeps
+    them lazy, so ``circuit.size()`` is 1 for a circuit that transpiles to
+    131,074 gates. Only generic ``Gate``/``Instruction`` objects carry such a
+    user definition (library gates are subclasses), so only those are recursed
+    into; each distinct definition is counted once and memoised by name.
+
+    Args:
+        circuit: The parsed circuit.
+        cap: Counts above this are clamped to ``cap + 1`` so the work stays bounded.
+
+    Returns:
+        The expanded count, or ``cap + 1`` when it exceeds ``cap``.
+    """
+    from qiskit.circuit import Gate, Instruction
+
+    memo: dict[str, int] = {}
+
+    def count(body: QuantumCircuit) -> int:
+        total = 0
+        for item in body.data:
+            op = item.operation
+            definition = None
+            if type(op) in (Gate, Instruction):
+                name = op.name
+                if name in memo:
+                    total += memo[name]
+                    if total > cap:
+                        return cap + 1
+                    continue
+                definition = op.definition
+                if definition is not None:
+                    memo[name] = size = min(count(definition), cap + 1)
+                    total += size
+                    if total > cap:
+                        return cap + 1
+                    continue
+            total += 1
+            if total > cap:
+                return cap + 1
+        return total
+
+    try:
+        return count(circuit)
+    except RecursionError:
+        return cap + 1
+
+
+def assert_parsed_circuit_is_affordable(circuit: QuantumCircuit) -> None:
+    """Refuse a parsed circuit whose width or expanded size is unbounded work.
+
+    This is the post-parse backstop behind ``guard_qasm``: that guard reads
+    source text and cannot see through a gate-definition tower, or evaluate every
+    register-size spelling OpenQASM 3 accepts.
+
+    Args:
+        circuit: The parsed circuit.
+
+    Raises:
+        ValueError: When the circuit is wider than ``MAX_PARSED_QUBITS`` or
+            expands to more than ``MAX_EXPANDED_OPERATIONS`` operations.
+    """
+    if circuit.num_qubits > MAX_PARSED_QUBITS:
+        raise ValueError(
+            f"Circuit has {circuit.num_qubits} qubits; this service accepts at most "
+            f"{MAX_PARSED_QUBITS}."
+        )
+    if expanded_operation_count(circuit) > MAX_EXPANDED_OPERATIONS:
+        raise ValueError(
+            "Circuit expands to more than "
+            f"{MAX_EXPANDED_OPERATIONS} operations once its gate definitions are "
+            "unrolled; simplify the nested gate definitions."
+        )
 
 
 def _declares_qasm2(qasm: str) -> bool:

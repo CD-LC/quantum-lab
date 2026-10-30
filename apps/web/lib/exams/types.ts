@@ -177,6 +177,12 @@ export interface ClientAttempt {
    * spends 25 minutes, that this attempt cannot become a certificate.
    */
   certifiable: boolean
+  /**
+   * ISO-8601, the SERVER's clock when this body was built. The runner takes its
+   * offset from the device clock once per adopt, so the countdown and the
+   * auto-submit do not depend on the candidate's system time being right.
+   */
+  serverNow?: string
 }
 
 // ────────────────────────────────────────────────────────────
@@ -207,14 +213,23 @@ export interface ExamGrade {
  * This is the only payload in the product that carries an answer key, and it
  * carries it for at most `exam.questionCount` items — the ones this candidate
  * actually sat — rather than for the whole bank.
+ *
+ * "Sat" means ANSWERED. A question the candidate left blank comes back with its
+ * verdict (`correct: false`, `answered: false`) and nothing else: no
+ * `correctIds`, no `correctNumber`, no `tolerance`, no `explanation`. Without
+ * that rule an empty submission was a free dump of the key for fifteen bank
+ * items, repeatable ten times a minute (see `toReviewQuestion` in engine.ts).
  */
 export interface ReviewQuestion extends PaperQuestion {
   correct: boolean
   earned: number
+  /** False when the candidate gave nothing gradeable; the key is then withheld. */
+  answered: boolean
   correctIds?: string[]
   correctNumber?: number
   tolerance?: number
-  explanation: string
+  /** Absent for an unanswered question. */
+  explanation?: string
 }
 
 /** The graded result, as the browser receives it. */
@@ -236,6 +251,12 @@ export interface ExamResultPayload {
   certificateId?: string
   /** True when a pass on this attempt could be turned into a certificate. */
   certifiable: boolean
+  /**
+   * ISO-8601, server clock. Set on a failed attempt: the moment from which the
+   * server will deal this subject a fresh paper at this exam. Advisory for the
+   * browser; `startAttempt` enforces it.
+   */
+  retakeAvailableAt?: string
 }
 
 // ────────────────────────────────────────────────────────────

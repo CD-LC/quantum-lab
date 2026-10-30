@@ -60,6 +60,8 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000'
 
 /** Requests are cut off after this long; the API may simply not be listening. */
 const TIMEOUT_MS = 8000
+/** Submitting a job waits for the provider; must exceed the proxy's SUBMIT_TIMEOUT_MS (45s). */
+const SUBMIT_CLIENT_TIMEOUT_MS = 50_000
 
 export type Result<T> =
   | { ok: true; data: T }
@@ -129,9 +131,10 @@ async function request<T>(
   url: string,
   init?: RequestInit,
   send: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response> = authFetch,
+  timeoutMs: number = TIMEOUT_MS,
 ): Promise<Result<T>> {
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS)
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
 
   try {
     const response = await send(url, {
@@ -183,7 +186,7 @@ async function request<T>(
       ok: false,
       offline: true,
       error: aborted
-        ? `No response from ${API_BASE} within ${TIMEOUT_MS / 1000}s.`
+        ? `No response from ${API_BASE} within ${timeoutMs / 1000}s.`
         : `Could not reach ${API_BASE}.`,
     }
   } finally {
@@ -302,7 +305,10 @@ export function submit(
       ...(opts.sessionId ? { session_id: opts.sessionId } : {}),
       ...(opts.sweep ? { sweep: opts.sweep } : {}),
     }),
-  })
+    // Longer than a read: the proxy waits up to SUBMIT_TIMEOUT_MS for the
+    // provider, and giving up sooner here would report "offline" for a job
+    // that is in fact being enqueued.
+  }, authFetch, SUBMIT_CLIENT_TIMEOUT_MS)
 }
 
 /**

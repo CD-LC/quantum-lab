@@ -9,7 +9,7 @@
 
 import { describe, expect, it } from 'vitest'
 import { callToolAsync, getTool } from '@/lib/mcp/server'
-import { parseGenerateArgs } from './mcpTool'
+import { GENERATE_MAX_CANDIDATE_OPS, parseGenerateArgs } from './mcpTool'
 import { presetById } from './specs'
 
 const BELL_QASM = 'OPENQASM 3.0;\ninclude "stdgates.inc";\nqubit[2] q;\nh q[0];\ncx q[0], q[1];'
@@ -26,6 +26,14 @@ describe('parseGenerateArgs', () => {
     const b = parseGenerateArgs({ spec: JSON.stringify(spec) })
     expect(b.ok).toBe(true)
     if (b.ok) expect(b.input.maxAttempts).toBe(3)
+  })
+
+  it('refuses a candidate with more gates than the ceiling', () => {
+    const spec = presetById('bell')!.spec
+    const many = 'OPENQASM 3.0;\ninclude "stdgates.inc";\nqubit[2] q;\n' + 'h q[0];\n'.repeat(GENERATE_MAX_CANDIDATE_OPS + 1)
+    const r = parseGenerateArgs({ spec, candidate_qasm: many })
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.error).toMatch(/ceiling/)
   })
 
   it('rejects a bad spec with every error listed', () => {

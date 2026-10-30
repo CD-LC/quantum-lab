@@ -65,6 +65,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Union
 
@@ -90,6 +91,34 @@ MAX_SECRET_CHARS = 4096
 
 #: Bound on any single public field (a CRN, a resource id, a bucket name).
 MAX_FIELD_CHARS = 512
+
+_GUID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+
+#: The SHAPE each public field must have, mirrored from
+#: ``PUBLIC_FIELD_SHAPES`` in apps/web/lib/security/providerCredentials.ts.
+#:
+#: These values are not only displayed: ``location`` and ``resource_id`` are fed
+#: to the Azure SDK, which builds an endpoint URL from them, and ``region``,
+#: ``s3_bucket`` and ``instance`` go to the IBM and AWS SDKs. A free account can
+#: store any of them, so a value such as ``host.example/x?`` in ``location``
+#: would make this service issue requests to a host of the caller's choosing.
+#: Re-checked here because this service is independently reachable and must not
+#: trust its caller's validation. Keyed ``provider.field``.
+_PUBLIC_SHAPES: dict[str, re.Pattern[str]] = {
+    "ibm.instance": re.compile(r"[A-Za-z0-9:._/\-]{1,512}"),
+    "braket.access_key_id": re.compile(r"[A-Z0-9]{16,128}"),
+    "braket.region": re.compile(r"[a-z]{2}(?:-[a-z]+)+-[0-9]"),
+    "braket.s3_bucket": re.compile(r"(?!.*\.\.)[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9]"),
+    "braket.s3_prefix": re.compile(r"(?!.*\.\.)[A-Za-z0-9._/\-]{1,256}"),
+    "azure.resource_id": re.compile(
+        rf"/subscriptions/{_GUID}/resourceGroups/[A-Za-z0-9._()\-]{{1,90}}"
+        r"/providers/Microsoft\.Quantum/Workspaces/[A-Za-z0-9_\-]{1,64}",
+        re.IGNORECASE,
+    ),
+    "azure.location": re.compile(r"[a-z0-9]{3,32}"),
+    "azure.tenant_id": re.compile(_GUID),
+    "azure.client_id": re.compile(_GUID),
+}
 
 PROVIDER_IBM = "ibm"
 PROVIDER_BRAKET = "braket"
@@ -316,24 +345,24 @@ def parse_credentials_header(raw: str | None) -> ProviderCredentials | None:
     if provider == PROVIDER_IBM:
         return IbmCredentials(
             token=_secret(payload, "token"),
-            instance=_optional_field(payload, "instance"),
+            instance=_optional_field(payload, "instance", PROVIDER_IBM),
         )
 
     if provider == PROVIDER_BRAKET:
         return BraketCredentials(
-            access_key_id=_field(payload, "access_key_id"),
+            access_key_id=_field(payload, "access_key_id", PROVIDER_BRAKET),
             secret_access_key=_secret(payload, "secret_access_key"),
             session_token=_optional_secret(payload, "session_token"),
-            region=_field(payload, "region"),
-            s3_bucket=_field(payload, "s3_bucket"),
-            s3_prefix=_optional_field(payload, "s3_prefix") or "quantum-lab",
+            region=_field(payload, "region", PROVIDER_BRAKET),
+            s3_bucket=_field(payload, "s3_bucket", PROVIDER_BRAKET),
+            s3_prefix=_optional_field(payload, "s3_prefix", PROVIDER_BRAKET) or "quantum-lab",
         )
 
     return AzureCredentials(
-        resource_id=_field(payload, "resource_id"),
-        location=_field(payload, "location"),
-        tenant_id=_field(payload, "tenant_id"),
-        client_id=_field(payload, "client_id"),
+        resource_id=_field(payload, "resource_id", PROVIDER_AZURE),
+        location=_field(payload, "location", PROVIDER_AZURE),
+        tenant_id=_field(payload, "tenant_id", PROVIDER_AZURE),
+        client_id=_field(payload, "client_id", PROVIDER_AZURE),
         client_secret=_secret(payload, "client_secret"),
     )
 
@@ -383,12 +412,40 @@ def _optional_secret(payload: dict[str, Any], key: str) -> str | None:
     return _secret(payload, key)
 
 
-def _field(payload: dict[str, Any], key: str) -> str:
+def _check_shape(provider: str, key: str, value: str) -> str:
+    """Pin a public field to its vendor-documented format.
+
+    Azure and AWS region names are case-insensitive upstream, so they are folded
+    to lower case before the check, exactly as the web layer does at storage.
+
+    Args:
+        provider: The provider the field belongs to.
+        key: The field name.
+        value: The trimmed value.
+
+    Returns:
+        The (possibly case-folded) value.
+
+    Raises:
+        InvalidCredentials: When the value does not match. The message names the
+            FIELD, never the value.
+    """
+    full_key = f"{provider}.{key}"
+    if full_key in ("azure.location", "braket.region"):
+        value = value.lower()
+    pattern = _PUBLIC_SHAPES.get(full_key)
+    if pattern is not None and pattern.fullmatch(value) is None:
+        raise InvalidCredentials(f"The presented {key} is not in the expected format.")
+    return value
+
+
+def _field(payload: dict[str, Any], key: str, provider: str | None = None) -> str:
     """Read and bound a REQUIRED public field.
 
     Args:
         payload: The decoded credential object.
         key: The field to read.
+        provider: When given, the field is also checked against its shape.
 
     Returns:
         The trimmed value.
@@ -404,15 +461,16 @@ def _field(payload: dict[str, Any], key: str) -> str:
         raise InvalidCredentials(
             f"The presented {key} must be at most {MAX_FIELD_CHARS} characters."
         )
-    return value
+    return _check_shape(provider, key, value) if provider else value
 
 
-def _optional_field(payload: dict[str, Any], key: str) -> str | None:
+def _optional_field(payload: dict[str, Any], key: str, provider: str | None = None) -> str | None:
     """Read a public field that may be absent (an IBM CRN, an S3 prefix).
 
     Args:
         payload: The decoded credential object.
         key: The field to read.
+        provider: When given, a present value is also checked against its shape.
 
     Returns:
         The trimmed value, or None.
@@ -432,4 +490,4 @@ def _optional_field(payload: dict[str, Any], key: str) -> str | None:
         raise InvalidCredentials(
             f"The presented {key} must be at most {MAX_FIELD_CHARS} characters."
         )
-    return value
+    return _check_shape(provider, key, value) if provider else value

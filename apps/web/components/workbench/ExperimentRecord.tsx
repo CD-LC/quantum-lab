@@ -179,7 +179,14 @@ function HardwareJob({ step }: { step: ExperimentStep }) {
   )
 }
 
-export function ExperimentRecord({ experiment, storageNote }: { experiment: Experiment; storageNote?: string }) {
+/**
+ * The record as the API serves it: no account id, only whether a signed-in
+ * account wrote it. The in-browser sample (a full Experiment with a null owner)
+ * is accepted too.
+ */
+export type RecordExperiment = Omit<Experiment, 'owner'> & { owner?: string | null; signedInAuthor?: boolean }
+
+export function ExperimentRecord({ experiment, storageNote }: { experiment: RecordExperiment; storageNote?: string }) {
   const concluded = experiment.conclusion !== null
   return (
     <div>
@@ -193,7 +200,7 @@ export function ExperimentRecord({ experiment, storageNote }: { experiment: Expe
           <span className="text-xs text-ink-muted">
             {experiment.steps.length} step{experiment.steps.length === 1 ? '' : 's'} · started{' '}
             <time dateTime={experiment.createdAt}>{formatWhen(experiment.createdAt)}</time>
-            {experiment.owner ? ' · signed-in author' : ' · anonymous author'}
+            {(experiment.signedInAuthor ?? Boolean(experiment.owner)) ? ' · signed-in author' : ' · anonymous author'}
           </span>
         </div>
         <h1 className="mt-3 text-3xl font-extrabold tracking-tight text-ink md:text-4xl">{experiment.title}</h1>

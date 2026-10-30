@@ -44,8 +44,9 @@
  */
 
 import { NextResponse } from 'next/server'
+import { apiError } from '@/lib/apiError'
 import { callerKey, rateLimit, retryAfterHeaders, type RateLimitRule } from '@/lib/rateLimit'
-import { isRecord, safeJson, str } from '@/lib/security/validate'
+import { isRecord, readJsonBody, str } from '@/lib/security/validate'
 import {
   callerHasScope,
   scopeRequiredResponse,
@@ -136,9 +137,33 @@ export function upstreamSecret(): string | null {
  * carries the distinction across the hop. `detail` is worded exactly as the
  * client used to word it, so the visible text does not change.
  */
-function offlineResponse(detail: string): NextResponse {
-  return NextResponse.json({ detail, offline: true }, { status: 504 })
+function offlineResponse(detail: string, outcomeUnknown = false): NextResponse {
+  return NextResponse.json(
+    { detail, offline: true },
+    { status: 504, ...(outcomeUnknown ? { headers: { [OUTCOME_HEADER]: 'unknown' } } : {}) }
+  )
 }
+
+/**
+ * Set on a 504 from `forward` when the request WAS SENT but no answer came back
+ * in time (an abort). The upstream handler may still be running, so for a call
+ * that creates something (a job submission) "no answer" is not "refused": a
+ * caller must not release a reservation on it. A connection that could not be
+ * made at all does NOT carry the header, because nothing was sent.
+ */
+export const OUTCOME_HEADER = 'x-qubit16-outcome'
+
+/** True for a `forward` result whose outcome upstream is unknown (timed out). */
+export function outcomeUnknown(response: Response): boolean {
+  return response.headers.get(OUTCOME_HEADER) === 'unknown'
+}
+
+/**
+ * Upstream timeout for calls that create a job. The submit handler upstream is
+ * synchronous (service set-up, transpile, enqueue), so the 8s read timeout cut
+ * healthy submissions off while the job went on to run.
+ */
+export const SUBMIT_TIMEOUT_MS = 45_000
 
 /**
  * Forward one request upstream and hand the answer back unchanged.
@@ -196,10 +221,13 @@ export async function forward(
    * Null (the default) means "use the operator's credentials", which is the
    * behaviour every caller had before this parameter existed.
    */
-  credential?: ResolvedCredential | null
+  credential?: ResolvedCredential | null,
+  /** Override the default 8s upstream timeout, e.g. SUBMIT_TIMEOUT_MS for a job submission. */
+  options?: { timeoutMs?: number }
 ): Promise<Response> {
+  const timeoutMs = options?.timeoutMs ?? UPSTREAM_TIMEOUT_MS
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS)
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
 
   const headers: Record<string, string> = {}
   if (body !== undefined) headers['content-type'] = 'application/json'
@@ -230,8 +258,9 @@ export async function forward(
     const aborted = err instanceof DOMException && err.name === 'AbortError'
     return offlineResponse(
       aborted
-        ? `No response from ${UPSTREAM_BASE} within ${UPSTREAM_TIMEOUT_MS / 1000}s.`
-        : `Could not reach ${UPSTREAM_BASE}.`
+        ? `No response from ${UPSTREAM_BASE} within ${timeoutMs / 1000}s.`
+        : `Could not reach ${UPSTREAM_BASE}.`,
+      aborted
     )
   } finally {
     clearTimeout(timer)
@@ -467,14 +496,15 @@ export const MAX_BODY_BYTES = 160_000
 /**
  * Read and parse a JSON object body, or return the 400 to send back.
  *
- * `safeJson` caps the byte length BEFORE `JSON.parse` allocates a second copy
- * of it (audit finding VAL-1); `await req.json()` on an unbounded body does
- * not.
+ * `readJsonBody` enforces the byte cap WHILE READING the stream (audit finding
+ * VAL-1), so an oversized body is refused with 413 without being buffered;
+ * `await req.json()` on an unbounded body is not.
  */
 export async function readJsonObject(
   req: Request
 ): Promise<{ ok: true; value: Record<string, unknown> } | { ok: false; response: NextResponse }> {
-  const parsed = safeJson(await req.text(), MAX_BODY_BYTES)
+  const parsed = await readJsonBody(req, MAX_BODY_BYTES)
+  if (!parsed.ok && parsed.tooLarge) return { ok: false, response: apiError('payload_too_large') }
   if (!parsed.ok) return { ok: false, response: badRequest(parsed.error) }
   if (!isRecord(parsed.value)) return { ok: false, response: badRequest('Expected a JSON object.') }
   return { ok: true, value: parsed.value }

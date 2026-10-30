@@ -50,7 +50,7 @@
 # only re-run when a package.json or the lockfile actually changes — editing a
 # .tsx file must not trigger a reinstall.
 ###############################################################################
-FROM node:20-alpine AS deps
+FROM node:22-alpine AS deps
 
 # Next's SWC binary is glibc-linked; alpine needs the compat shim.
 RUN apk add --no-cache libc6-compat
@@ -80,7 +80,7 @@ RUN npm ci --no-audit --no-fund
 # standalone server. Nothing from this stage survives except the three
 # directories the runner copies.
 ###############################################################################
-FROM node:20-alpine AS builder
+FROM node:22-alpine AS builder
 
 RUN apk add --no-cache libc6-compat
 
@@ -168,13 +168,31 @@ ARG NEXT_PUBLIC_LAUNCH_TRIAL_UNTIL=""
 # in production. So it appears in the ARG/ENV pair below, in deploy.sh's
 # build-arg list AND its WEB_ENV_VARS list, and in .env.example.
 ARG NEXT_PUBLIC_DEVICE_TUTOR=""
+# The commit this image is built from. deploy.yml passes the full SHA.
+#   - NEXT_PUBLIC_SENTRY_RELEASE: read by lib/observability/release.ts (Sentry
+#     release, /api/health `version`). Inlined at build, so it reaches both the
+#     server and the browser bundle.
+#   - NEXT_PUBLIC_BUILD_STAMP: next.config.mjs uses it as the build id and the
+#     service-worker cache name, so rebuilding the same commit does not evict
+#     every installed user's cache. next.config.mjs sanitises and truncates it.
+# Not secrets (a commit SHA of a public repo). Empty default: a local build
+# with no value falls back to 'unknown' / a timestamp exactly as before.
+ARG NEXT_PUBLIC_SENTRY_RELEASE=""
+ARG NEXT_PUBLIC_BUILD_STAMP=""
+# deploy.yml and deploy.sh already pass this as a build arg; without an ARG here
+# Docker silently drops it and the first-party analytics endpoint stays off.
+ARG NEXT_PUBLIC_ANALYTICS_ENDPOINT=""
 ENV NEXT_PUBLIC_APP_URL=$NEXT_PUBLIC_APP_URL \
     NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL \
     NEXT_PUBLIC_SUPABASE_URL=$NEXT_PUBLIC_SUPABASE_URL \
     NEXT_PUBLIC_SUPABASE_ANON_KEY=$NEXT_PUBLIC_SUPABASE_ANON_KEY \
     NEXT_PUBLIC_SENTRY_DSN=$NEXT_PUBLIC_SENTRY_DSN \
     NEXT_PUBLIC_LAUNCH_TRIAL_DAYS=$NEXT_PUBLIC_LAUNCH_TRIAL_DAYS \
-    NEXT_PUBLIC_LAUNCH_TRIAL_UNTIL=$NEXT_PUBLIC_LAUNCH_TRIAL_UNTIL     NEXT_PUBLIC_DEVICE_TUTOR=$NEXT_PUBLIC_DEVICE_TUTOR
+    NEXT_PUBLIC_LAUNCH_TRIAL_UNTIL=$NEXT_PUBLIC_LAUNCH_TRIAL_UNTIL \
+    NEXT_PUBLIC_DEVICE_TUTOR=$NEXT_PUBLIC_DEVICE_TUTOR \
+    NEXT_PUBLIC_SENTRY_RELEASE=$NEXT_PUBLIC_SENTRY_RELEASE \
+    NEXT_PUBLIC_BUILD_STAMP=$NEXT_PUBLIC_BUILD_STAMP \
+    NEXT_PUBLIC_ANALYTICS_ENDPOINT=$NEXT_PUBLIC_ANALYTICS_ENDPOINT
 
 # NOTE ON SECRETS: no *secret* is passed in here, and none needs to be. This
 # project builds correctly with an entirely empty environment — the course,
@@ -197,7 +215,7 @@ RUN npm run build --workspace=web
 # the bottom of this file for the `npm ci --omit=dev` variant used when
 # standalone output is unavailable.
 ###############################################################################
-FROM node:20-alpine AS runner
+FROM node:22-alpine AS runner
 
 RUN apk add --no-cache libc6-compat
 

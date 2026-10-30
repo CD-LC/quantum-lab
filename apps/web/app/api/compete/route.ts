@@ -33,8 +33,9 @@ import {
   getCompeteStore,
   type CompetitionEntry,
 } from '@/lib/compete/store'
-import { callerKey, rateLimit } from '@/lib/rateLimit'
+import { callerKey, rateLimit, retryAfterHeaders } from '@/lib/rateLimit'
 import { verifiedCaller } from '@/lib/security/auth'
+import { readBodyText } from '@/lib/security/validate'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -45,6 +46,12 @@ const MAX_BODY_BYTES = 32_768
 const MAX_NAME_CHARS = 40
 /** Submissions per caller per minute. Grading is cheap; noise is not. */
 const POST_RULE = { limit: 12, windowMs: 60_000 }
+/**
+ * Reads per caller per minute. Each uncached GET costs a Supabase query (three,
+ * plus an auth lookup when a bearer is attached), and it is anonymous, so
+ * without this a loop drives database load for free. A page load makes one.
+ */
+const GET_RULE = { limit: 60, windowMs: 60_000 }
 
 /**
  * The client-safe slice of a competition. An explicit field list, not a
@@ -80,6 +87,13 @@ function sanitiseDisplayName(raw: unknown, accountId: string): string {
 }
 
 export async function GET(req: Request): Promise<Response> {
+  // Keyed on the IP: this runs before (and so without paying for) token
+  // verification, which is the expensive part for an anonymous flood.
+  const readDecision = await rateLimit(callerKey(req.headers, 'compete-read'), GET_RULE)
+  if (!readDecision.allowed) {
+    return apiError('rate_limited', { headers: retryAfterHeaders(readDecision) })
+  }
+
   const comp = currentCompetition(new Date())
   const store = getCompeteStore()
 
@@ -138,11 +152,12 @@ export async function POST(req: Request): Promise<Response> {
     })
   }
 
-  const raw = await req.text()
-  if (raw.length > MAX_BODY_BYTES) return apiError('payload_too_large')
+  // Cap enforced while reading, so an oversized upload is never buffered.
+  const rawBody = await readBodyText(req, MAX_BODY_BYTES)
+  if (!rawBody.ok) return rawBody.tooLarge ? apiError('payload_too_large') : badRequest(rawBody.error)
   let body: unknown
   try {
-    body = JSON.parse(raw)
+    body = JSON.parse(rawBody.value)
   } catch {
     return badRequest('The request body must be JSON.')
   }

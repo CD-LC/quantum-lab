@@ -8,6 +8,8 @@ import { NextResponse } from 'next/server'
 import { apiError } from '@/lib/apiError'
 import { callerKey, rateLimit, retryAfterHeaders, type RateLimitRule } from '@/lib/rateLimit'
 import { uuid } from '@/lib/security/validate'
+import { toPublic } from '@/lib/workbench/experiments'
+import { reportError } from '@/lib/observability/report'
 import { getExperimentStore } from '@/lib/workbench/experimentStore'
 
 export const runtime = 'nodejs'
@@ -30,11 +32,9 @@ export async function GET(
   try {
     const experiment = await store.get(checked.value)
     if (!experiment) return NextResponse.json({ error: 'No experiment with that id.' }, { status: 404 })
-    return NextResponse.json({ storage: store.kind, experiment })
+    return NextResponse.json({ storage: store.kind, experiment: toPublic(experiment) })
   } catch (cause) {
-    return NextResponse.json(
-      { error: cause instanceof Error ? cause.message : 'Could not read the experiment.' },
-      { status: 503 },
-    )
+    reportError(cause, { route: 'api/workbench/experiments/[id]', stage: 'get' })
+    return apiError('upstream_unavailable', { message: 'The experiment store is unavailable right now.', status: 503 })
   }
 }

@@ -16,7 +16,18 @@ echo "dispatch: HTTP ${status}"
 cat /tmp/dispatch-body.json
 echo ""
 
+# HTTP 200 with a non-empty "failures" array means some sends failed (the
+# route reports per-recipient errors in the body, not in the status). Exit
+# non-zero so the Container Apps job execution shows Failed and can alert,
+# instead of a green run that silently dropped emails. No jq in this image:
+# the report is compact JSON, so an empty array is the literal "failures":[].
 case "$status" in
-  2??) exit 0 ;;
+  2??)
+    if grep -q '"failures"' /tmp/dispatch-body.json \
+       && ! grep -Eq '"failures"[[:space:]]*:[[:space:]]*\[[[:space:]]*\]' /tmp/dispatch-body.json; then
+      echo "dispatch: report lists failures — exiting non-zero" >&2
+      exit 1
+    fi
+    exit 0 ;;
   *) exit 1 ;;
 esac

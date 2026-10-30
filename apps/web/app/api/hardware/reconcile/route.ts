@@ -72,7 +72,7 @@ import {
   type ReconcileReport,
 } from '@/lib/hardware/reconcile'
 import { callerKey, rateLimit, retryAfterHeaders } from '@/lib/rateLimit'
-import { isRecord, safeJson } from '@/lib/security/validate'
+import { isRecord, readBodyText, safeJson } from '@/lib/security/validate'
 import { apiError, badRequest } from '@/lib/apiError'
 
 export const runtime = 'nodejs'
@@ -144,8 +144,12 @@ export async function POST(req: Request): Promise<NextResponse> {
     })
   }
 
-  const raw = await req.text()
-  const parsed = raw.trim().length === 0 ? { ok: true as const, value: {} } : safeJson(raw, 1_024)
+  const raw = await readBodyText(req, 1_024)
+  if (!raw.ok) {
+    return raw.tooLarge ? apiError('payload_too_large') : badRequest(raw.error)
+  }
+  const parsed =
+    raw.value.trim().length === 0 ? { ok: true as const, value: {} } : safeJson(raw.value, 1_024)
   if (!parsed.ok) return badRequest(parsed.error)
   const body = isRecord(parsed.value) ? parsed.value : {}
 

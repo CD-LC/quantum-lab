@@ -189,6 +189,52 @@ const MAX_URL_CHARS = 400
 const MAX_NOTE_CHARS = 500
 const MAX_PER_DAY = 100_000
 
+/**
+ * Hosts a provider's `baseUrl` may point at. Only Azure takes a base URL (the
+ * others use their SDK's fixed endpoint), and an Azure OpenAI / AI Foundry
+ * resource always lives under one of these suffixes. The admin test route sends
+ * the provider key to this URL, and the tutor sends every prompt to it, so an
+ * arbitrary host here is a credential-exfiltration and internal-probe primitive.
+ *
+ * Extra hosts (a sovereign cloud, a private endpoint name) can be added with the
+ * optional PLATFORM_LLM_ALLOWED_HOSTS env var: a comma-separated list of exact
+ * hostnames or `.suffix` entries. Unset, only the Azure suffixes are accepted.
+ */
+const AZURE_HOST_SUFFIXES = [
+  '.openai.azure.com',
+  '.cognitiveservices.azure.com',
+  '.services.ai.azure.com',
+]
+
+function extraAllowedHosts(): string[] {
+  return (process.env.PLATFORM_LLM_ALLOWED_HOSTS ?? '')
+    .split(',')
+    .map((h) => h.trim().toLowerCase())
+    .filter(Boolean)
+}
+
+/** True for an https URL on an allowed provider host that is not an IP literal. */
+export function isAllowedProviderBaseUrl(id: ProviderId, value: string): boolean {
+  if (id !== 'azure') return false
+  let url: URL
+  try {
+    url = new URL(value)
+  } catch {
+    return false
+  }
+  if (url.protocol !== 'https:' || url.username || url.password) return false
+  if (url.port && url.port !== '443') return false
+  const host = url.hostname.toLowerCase().replace(/\.$/, '')
+  // IP literals (v4 or v6) are never a provider host.
+  if (host.includes(':') || /^[0-9.]+$/.test(host) || /^0x/i.test(host)) return false
+  if (AZURE_HOST_SUFFIXES.some((suffix) => host.endsWith(suffix) && host.length > suffix.length)) {
+    return true
+  }
+  return extraAllowedHosts().some((entry) =>
+    entry.startsWith('.') ? host.endsWith(entry) && host.length > entry.length : host === entry
+  )
+}
+
 function cleanString(value: unknown, max: number): string | undefined {
   if (typeof value !== 'string') return undefined
   return value.trim().slice(0, max)
@@ -232,7 +278,11 @@ export function applyLlmPatch(base: LlmSettings, patch: LlmSettingsPatch): LlmSe
       const model = cleanString(p.model, MAX_MODEL_CHARS)
       if (model !== undefined) cur.model = model
       const baseUrl = cleanString(p.baseUrl, MAX_URL_CHARS)
-      if (baseUrl !== undefined) cur.baseUrl = baseUrl
+      // An empty string clears the field; anything else must be an allowed
+      // provider host or the patch keeps the current value.
+      if (baseUrl !== undefined && (baseUrl === '' || isAllowedProviderBaseUrl(id, baseUrl))) {
+        cur.baseUrl = baseUrl
+      }
       const apiVersion = cleanString(p.apiVersion, 64)
       if (apiVersion !== undefined) cur.apiVersion = apiVersion
       if (typeof p.enabled === 'boolean') cur.enabled = p.enabled

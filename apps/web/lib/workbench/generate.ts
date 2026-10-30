@@ -29,12 +29,16 @@ import {
   type GateName,
   type GateOp,
 } from '@/lib/quantum'
+import { reportError } from '@/lib/observability/report'
 import { diffCircuits, type CircuitDiff } from './diff'
 import { formatDiagnostics, verify, type CircuitSpec, type VerifyResult } from './verify'
 
 // ────────────────────────────────────────────────────────────
 // Provider adapter — the only seam to a model
 // ────────────────────────────────────────────────────────────
+
+/** What a caller is told when the model provider fails. Never the provider's own text. */
+export const PROVIDER_FAILED = 'The model provider returned an error; try again later.'
 
 export interface CompletionRequest {
   system: string
@@ -438,7 +442,12 @@ export async function generateVerifiedCircuit(
       modelCalls += 1
       reply = await provider.complete({ system, user, maxTokens: REPLY_MAX_TOKENS }, options.signal)
     } catch (cause) {
-      const message = cause instanceof Error ? cause.message : String(cause)
+      // A provider's failure text (AI SDK call errors carry the upstream
+      // response body: deployment and model names, quota wording, hostnames)
+      // is for observability. The result is returned to anonymous callers, so
+      // it gets a fixed sentence.
+      reportError(cause, { module: 'workbench/generate', stage: 'provider' })
+      const message = PROVIDER_FAILED
       record({
         index: attempts.length + 1,
         source: 'model',

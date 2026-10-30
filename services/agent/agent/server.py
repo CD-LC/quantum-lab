@@ -13,12 +13,13 @@ Run it with::
 
 from __future__ import annotations
 
+import logging
 import time
 import warnings
 from typing import Any, Literal
 
 import httpx
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -33,6 +34,8 @@ from agent.tools import TOOL_NAMES
 # raises only on a misconfiguration that would otherwise be silent — a '*' in
 # ALLOWED_ORIGINS, or a clamp set non-positive. See agent/env_check.py.
 check_env()
+
+logger = logging.getLogger(__name__)
 
 __all__ = ["app", "ChatRequest", "ChatResponse", "HealthResponse"]
 
@@ -85,6 +88,8 @@ _MAX_CHARS = 8_000
 _MAX_HISTORY = 20
 #: Characters of attached circuit source. The editor never produces this much.
 _MAX_QASM_CHARS = 20_000
+#: Characters of the opted-in study plan.
+_MAX_PLAN_CHARS = 2_048
 
 
 class HistoryTurn(BaseModel):
@@ -111,6 +116,11 @@ class ChatRequest(BaseModel):
     history: list[HistoryTurn] = Field(default_factory=list, max_length=_MAX_HISTORY)
     circuit_qasm: str | None = Field(
         None, max_length=_MAX_QASM_CHARS, description="QASM currently open in the editor."
+    )
+    learner_plan: str | None = Field(
+        None,
+        max_length=_MAX_PLAN_CHARS,
+        description="Study plan the learner opted in to sharing (computed by the web app).",
     )
     llm: LlmOverrideBody | None = Field(
         None, description="Optional provider/key override resolved by the web app."
@@ -168,9 +178,20 @@ def chat(request: ChatRequest) -> ChatResponse:
             history=[turn.model_dump() for turn in request.history],
             circuit_qasm=request.circuit_qasm,
             llm_override=request.llm.model_dump() if request.llm else None,
+            learner_plan=request.learner_plan,
         )
     except RuntimeError as exc:
         return ChatResponse(reply=str(exc), tools_used=[], configured=False)
+    except Exception as exc:  # noqa: BLE001 - provider and tool failures are not 500s
+        # A revoked or over-quota key, a provider outage, a context-window
+        # overflow: litellm raises these as openai-style exceptions, none of
+        # them a RuntimeError. Class name only; the message can echo the
+        # learner's input or the provider's account details.
+        logger.warning("agent chat failed: %s", type(exc).__name__)
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "provider_error", "type": type(exc).__name__},
+        ) from None
 
     return ChatResponse(
         reply=result.get("reply", ""),

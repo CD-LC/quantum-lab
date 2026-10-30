@@ -235,7 +235,10 @@ It recognises the app from Chrome's `android-app://ai.qubit16.app` referrer and
 from the launch URL, which is `https://qubit16.ai/?app=android`
 (`manifestPlaceholders["defaultUrl"]` in `app/build.gradle.kts`; `versionCode`
 2). The referrer alone already works for the version-1 build on Play; the URL
-marker needs version 2 uploaded.
+marker needs version 2 uploaded. The URL marker is only honoured on an Android
+user agent in `standalone`/`fullscreen` display mode (which a TWA is), so a
+shared `https://qubit16.ai/pricing?app=android` link opened in an ordinary
+browser tab does not hide anything.
 
 ## Building the bundle in CI
 

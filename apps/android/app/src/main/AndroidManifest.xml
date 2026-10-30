@@ -100,6 +100,16 @@
                 android:name="android.support.customtabs.trusted.SCREEN_ORIENTATION"
                 android:value="unspecified" />
 
+            <!-- App shortcuts (long-press the launcher icon): Simulator, Course,
+                 Learning Paths, Visualizations — mirrors the three PWA shortcuts
+                 in apps/web/public/manifest.webmanifest, swapping in Paths
+                 (2026-09-18) as the fourth slot; four is the safe cross-device
+                 maximum for static shortcuts. Declared on the one component that
+                 carries MAIN/LAUNCHER: exactly one launcher icon, and it has them. -->
+            <meta-data
+                android:name="android.app.shortcuts"
+                android:resource="@xml/shortcuts" />
+
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -117,24 +127,6 @@
             </intent-filter>
         </activity>
 
-        <!-- App shortcuts (long-press the launcher icon): Simulator, Course,
-             Learning Paths, Visualizations — mirrors the three PWA shortcuts
-             in apps/web/public/manifest.webmanifest, swapping in Paths
-             (2026-09-18) as the fourth slot; four is the safe cross-device
-             maximum for static shortcuts. -->
-        <activity-alias
-            android:name="ai.qubit16.app.LauncherActivityAlias"
-            android:targetActivity="ai.qubit16.app.LauncherActivity"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-            <meta-data
-                android:name="android.app.shortcuts"
-                android:resource="@xml/shortcuts" />
-        </activity-alias>
-
         <!-- Delegates web push (once wired up) to a native notification with
              this app's icon instead of Chrome's. This is androidbrowserhelper's
              own service, referenced directly rather than subclassed — the
@@ -143,9 +135,15 @@
              that. -->
         <service
             android:name="com.google.androidbrowserhelper.trusted.DelegationService"
-            android:exported="false">
+            android:exported="true">
+            <!-- exported="true" is required: the service is bound by Chrome, a
+                 different package, and the system refuses that bind otherwise.
+                 This matches androidbrowserhelper's and Bubblewrap's reference
+                 manifests; Chrome only delegates to the package that
+                 assetlinks.json names for the origin. -->
             <intent-filter>
                 <action android:name="android.support.customtabs.trusted.TRUSTED_WEB_ACTIVITY_SERVICE" />
+                <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </service>
         <meta-data

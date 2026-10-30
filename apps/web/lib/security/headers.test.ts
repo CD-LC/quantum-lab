@@ -41,6 +41,14 @@ describe('embedFrameAncestors', () => {
     vi.stubEnv('NEXT_PUBLIC_EMBED_ANCESTORS', 'not-a-url https://vegaduta.ai *')
     expect(embedFrameAncestors()).toEqual(['https://vegaduta.ai'])
   })
+
+  it('drops non-web schemes whose origin is the opaque "null"', () => {
+    vi.stubEnv(
+      'NEXT_PUBLIC_EMBED_ANCESTORS',
+      'javascript:alert(1) data:text/html,x ftp://example.com https://vegaduta.ai',
+    )
+    expect(embedFrameAncestors()).toEqual(['https://vegaduta.ai'])
+  })
 })
 
 describe('cspDirectives embed option', () => {

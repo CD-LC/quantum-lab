@@ -13,6 +13,9 @@ import { createHmac } from 'node:crypto'
 import { beforeEach, describe, expect, it } from 'vitest'
 import {
   __resetWebhookStoreForTests,
+  __setHostResolverForTests,
+  assertPublicHost,
+  isNonPublicAddress,
   deliverToEndpoint,
   dispatchNow,
   dispatchWebhookEventOnce,
@@ -32,6 +35,9 @@ import {
 
 beforeEach(() => {
   __resetWebhookStoreForTests()
+  // No test touches the network: every name resolves to a public address unless
+  // a test installs its own resolver.
+  __setHostResolverForTests(async () => ['93.184.216.34'])
 })
 
 // ── Test doubles ────────────────────────────────────────────────────────────
@@ -306,5 +312,62 @@ describe('dispatchWebhookEventOnce', () => {
     // Distinct key is accepted again (no throw). 'nobody' has no endpoints,
     // so the detached dispatch resolves without any network activity.
     expect(dispatchWebhookEventOnce('k2', 'exam_passed', {}, 'nobody')).toBeUndefined()
+  })
+})
+
+
+// ── DNS resolution guard ────────────────────────────────────────────────────
+
+describe('resolved-address SSRF guard', () => {
+  it('classifies private, special and public addresses', () => {
+    for (const bad of [
+      '127.0.0.1', '10.1.2.3', '169.254.169.254', '172.16.0.9', '192.168.1.1', '100.64.0.1',
+      '0.0.0.0', '224.0.0.1', '198.18.0.1', '::1', '::', 'fd00::1', 'fe80::1', 'ff02::1',
+      '::ffff:10.0.0.1', '::ffff:a00:1', '2001:db8::1', 'not-an-ip',
+    ]) {
+      expect(isNonPublicAddress(bad), bad).toBe(true)
+    }
+    for (const good of ['93.184.216.34', '8.8.8.8', '2606:4700:4700::1111']) {
+      expect(isNonPublicAddress(good), good).toBe(false)
+    }
+  })
+
+  it('refuses a public-looking name that resolves to a private address', async () => {
+    __setHostResolverForTests(async () => ['127.0.0.1'])
+    const result = await registerEndpoint('u', 'https://127.0.0.1.nip.io/x', ['exam_passed'])
+    expect(result.ok).toBe(false)
+  })
+
+  it('refuses when any one of several answers is private', async () => {
+    __setHostResolverForTests(async () => ['93.184.216.34', '10.0.0.5'])
+    expect((await assertPublicHost(new URL('https://mixed.example.com/'))).ok).toBe(false)
+  })
+
+  it('fails closed when the name does not resolve', async () => {
+    __setHostResolverForTests(async () => {
+      throw new Error('ENOTFOUND')
+    })
+    expect((await assertPublicHost(new URL('https://nope.example.com/'))).ok).toBe(false)
+    __setHostResolverForTests(async () => [])
+    expect((await assertPublicHost(new URL('https://empty.example.com/'))).ok).toBe(false)
+  })
+
+  it('refuses internal namespaces without a lookup', () => {
+    for (const url of [
+      'https://agent.internal.env.eastus.azurecontainerapps.io/x',
+      'https://box.internal/x',
+      'https://printer.local/x',
+    ]) {
+      expect(validateWebhookUrl(url).ok, url).toBe(false)
+    }
+  })
+
+  it('does not deliver when the name resolves privately at dispatch time', async () => {
+    const endpoint = await endpointFor('user-rebind')
+    __setHostResolverForTests(async () => ['10.0.0.8'])
+    const { deps, calls } = fakeFetch([200])
+    const outcome = await deliverToEndpoint(endpoint, 'exam_passed', '{}', 'evt_x', deps)
+    expect(outcome).toEqual({ delivered: false, attempts: 0 })
+    expect(calls).toHaveLength(0)
   })
 })

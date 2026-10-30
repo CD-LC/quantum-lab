@@ -81,6 +81,12 @@ _POSITIVE_CLAMPS = (
     "max_message_chars",
     "max_shots",
     "max_tokens",
+    "llm_request_timeout",
+    "max_qubits",
+    "max_circuit_gates",
+    "max_qasm_chars",
+    "max_sim_work",
+    "sim_max_memory_mb",
 )
 
 

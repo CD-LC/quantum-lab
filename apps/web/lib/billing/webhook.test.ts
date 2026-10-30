@@ -28,6 +28,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import Stripe from 'stripe'
 
 interface SubRow {
   user_id: string
@@ -172,6 +173,7 @@ vi.mock('@/lib/billing/stripe', () => ({
     id === 'price_pro' ? 'pro' : id === 'price_team' ? 'team' : null,
   priceIdFor: () => null,
   APP_URL: 'http://app.test',
+  STRIPE_API_VERSION: '2024-10-28.acacia',
 }))
 
 process.env.NEXT_PUBLIC_SUPABASE_URL = 'https://project.supabase.test'
@@ -312,9 +314,44 @@ describe('POST /api/billing/webhook — replays', () => {
 
     // Not persisted, so the retry will be processed rather than skipped.
     expect(db.state.stripe_events).toHaveLength(0)
-    expect(response.status).toBe(200) // unusable event: a retry cannot help
+    // A Stripe outage is transient: 500 so Stripe redelivers. A 200 here dropped
+    // the event for good.
+    expect(response.status).toBe(500)
     stripe.client.subscriptions.retrieve = async (id: string) =>
       stripe.state.subs.get(id) ?? null
+  })
+
+  it('retries on a Stripe rate limit or connection error', async () => {
+    const failing = event('evt_429', 'invoice.payment_failed', { subscription: 'sub_x' }, 1000)
+    stripe.client.subscriptions.retrieve = async () => {
+      throw new Stripe.errors.StripeRateLimitError({ message: 'slow down', type: 'rate_limit_error' })
+    }
+    const limited = await deliver(failing)
+    stripe.client.subscriptions.retrieve = async () => {
+      throw new Stripe.errors.StripeConnectionError({ message: 'socket hang up', type: 'api_error' })
+    }
+    const dropped = await deliver(failing)
+    stripe.client.subscriptions.retrieve = async (id: string) =>
+      stripe.state.subs.get(id) ?? null
+
+    expect(limited.status).toBe(500)
+    expect(dropped.status).toBe(500)
+  })
+
+  it('acknowledges a request Stripe will always refuse (no such subscription)', async () => {
+    const failing = event('evt_gone', 'invoice.payment_failed', { subscription: 'sub_gone' }, 1000)
+    stripe.client.subscriptions.retrieve = async () => {
+      throw new Stripe.errors.StripeInvalidRequestError({
+        message: 'No such subscription',
+        type: 'invalid_request_error',
+      })
+    }
+    const response = await deliver(failing)
+    stripe.client.subscriptions.retrieve = async (id: string) =>
+      stripe.state.subs.get(id) ?? null
+
+    // A retry cannot fix it, so 200 rather than 3 days of redeliveries.
+    expect(response.status).toBe(200)
   })
 })
 
@@ -400,7 +437,13 @@ describe('POST /api/billing/webhook — checkout.session.completed', () => {
       event(
         'evt_checkout',
         'checkout.session.completed',
-        { client_reference_id: USER, customer: 'cus_1', subscription: 'sub_9', metadata: {} },
+        {
+          mode: 'subscription',
+          client_reference_id: USER,
+          customer: 'cus_1',
+          subscription: 'sub_9',
+          metadata: { userId: USER, planId: 'pro' },
+        },
         3_000_000
       )
     )
@@ -418,5 +461,107 @@ describe('POST /api/billing/webhook — checkout.session.completed', () => {
 
     expect(response.status).toBe(200)
     expect(db.state.subscriptions).toHaveLength(0)
+  })
+
+  // The session's own claims are not trusted on their own: only a session this
+  // app created is applied.
+  const goodSession = (over: Record<string, unknown> = {}) => ({
+    mode: 'subscription',
+    client_reference_id: USER,
+    customer: 'cus_1',
+    subscription: 'sub_9',
+    metadata: { userId: USER, planId: 'pro' },
+    ...over,
+  })
+
+  it.each([
+    ['a payment-mode session', { mode: 'payment' }],
+    ['a session with no mode', { mode: undefined }],
+    ['a client_reference_id that disagrees with metadata.userId', {
+      client_reference_id: '22222222-2222-4222-8222-222222222222',
+    }],
+    ['a client_reference_id with no metadata.userId', { metadata: { planId: 'pro' } }],
+    ['a user id that is not a UUID', {
+      client_reference_id: 'not-a-uuid',
+      metadata: { userId: 'not-a-uuid' },
+    }],
+    ['a paid session with no subscription', { subscription: null }],
+  ])('ignores %s', async (_label, over) => {
+    stripe.state.subs.set('sub_9', subscriptionObject('sub_9', 'price_pro'))
+
+    const response = await deliver(
+      event('evt_x', 'checkout.session.completed', goodSession(over), 3_000_000)
+    )
+
+    // Acknowledged (a retry cannot help) but nothing is written.
+    expect(response.status).toBe(200)
+    expect(db.state.rpcCalls).toHaveLength(0)
+    expect(db.state.subscriptions).toHaveLength(0)
+  })
+
+  it('falls back to a known paid plan from metadata, never to free or an unknown plan', async () => {
+    stripe.state.subs.set('sub_9', subscriptionObject('sub_9', 'price_unmapped'))
+
+    await deliver(
+      event('evt_a', 'checkout.session.completed', goodSession({ metadata: { userId: USER, planId: 'team' } }), 3_000_000)
+    )
+    expect(row()?.plan_id).toBe('team')
+
+    db.state.subscriptions.length = 0
+    db.state.rpcCalls.length = 0
+    await deliver(
+      event('evt_b', 'checkout.session.completed', goodSession({ metadata: { userId: USER, planId: 'edu' } }), 3_000_001)
+    )
+    // 'edu' is contact-sales, not self-serve: nothing is granted from the metadata.
+    expect(db.state.subscriptions).toHaveLength(0)
+  })
+
+  it('tolerates a malformed event payload without throwing', async () => {
+    const response = await deliver({ id: 'evt_bad', type: 'checkout.session.completed', created: 1 })
+    expect(response.status).toBe(200)
+    expect(db.state.subscriptions).toHaveLength(0)
+  })
+})
+
+// ── endpoint API version ────────────────────────────────────────────────────
+
+describe('POST /api/billing/webhook — endpoint API version', () => {
+  it('re-reads a subscription delivered by an endpoint on another API version', async () => {
+    // A newer-version payload has no top-level current_period_end. The pinned
+    // re-read does, and that is what must be written.
+    const delivered = subscriptionObject('sub_1', 'price_pro', { current_period_end: undefined })
+    stripe.state.subs.set('sub_1', subscriptionObject('sub_1', 'price_pro'))
+
+    await deliver({
+      ...event('evt_v', 'customer.subscription.updated', delivered, 1_000_000),
+      api_version: '2025-03-31.basil',
+    })
+
+    expect(row()?.current_period_end).toBe(new Date(1_750_000_000 * 1000).toISOString())
+  })
+
+  it('uses the payload as delivered when the versions agree', async () => {
+    // Nothing in the fake store: a re-read would find null and fail.
+    await deliver({
+      ...event('evt_v', 'customer.subscription.updated', subscriptionObject('sub_1', 'price_team'), 1_000_000),
+      api_version: '2024-10-28.acacia',
+    })
+
+    expect(row()?.plan_id).toBe('team')
+  })
+
+  it('finds the subscription of a failed invoice under the newer parent shape', async () => {
+    stripe.state.subs.set('sub_1', subscriptionObject('sub_1', 'price_pro'))
+
+    await deliver(
+      event(
+        'evt_inv',
+        'invoice.payment_failed',
+        { parent: { subscription_details: { subscription: 'sub_1' } } },
+        1_000_000
+      )
+    )
+
+    expect(row()?.status).toBe('past_due')
   })
 })

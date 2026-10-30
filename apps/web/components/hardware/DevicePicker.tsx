@@ -332,8 +332,12 @@ export function DevicePicker({ devices, value, onChange, circuitDepth }: DeviceP
               )}
 
               {device.available ? (
-                <span className="pill" style={{ color: 'var(--q-teal-text)', borderColor: 'rgb(var(--q-teal-rgb) / 0.45)' }}>
-                  available
+                <span
+                  className="pill"
+                  style={{ color: 'var(--q-teal-text)', borderColor: 'rgb(var(--q-teal-rgb) / 0.45)' }}
+                  title={device.byok ? 'Runs on the credential you saved for this vendor, not the platform\'s.' : undefined}
+                >
+                  {device.byok ? 'your account' : 'available'}
                 </span>
               ) : (
                 <span className="pill text-ink-muted">not configured</span>

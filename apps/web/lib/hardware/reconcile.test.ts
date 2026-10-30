@@ -50,6 +50,12 @@ const fake = vi.hoisted(() => {
     payloads: new Map<string, Record<string, unknown>>(),
     /** Every upstream path the sweep asked for, in order. */
     polls: [] as string[],
+    /** The credential (if any) presented on each poll, parallel to `polls`. */
+    pollCredentials: [] as unknown[],
+    /** Stored BYOK credentials by `userId:provider`. Missing means none. */
+    credentials: new Map<string, { provider: string; secret: string }>(),
+    /** Makes opening a BYOK credential throw (store outage). */
+    credentialStoreDown: false,
     /** Resolves a poll only when released, so overlap can be staged. */
     gate: null as null | Promise<void>,
   }
@@ -141,8 +147,9 @@ vi.mock('@/lib/billing/entitlements', () => ({
 }))
 
 vi.mock('@/lib/hardware/proxy', () => ({
-  async forward(path: string) {
+  async forward(path: string, _body?: unknown, _method?: string, credential?: unknown) {
     fake.state.polls.push(path)
+    fake.state.pollCredentials.push(credential ?? null)
     if (fake.state.gate) await fake.state.gate
     const jobId = decodeURIComponent(path.split('/').slice(5).join('/'))
     const payload = fake.state.payloads.get(jobId)
@@ -152,6 +159,13 @@ vi.mock('@/lib/hardware/proxy', () => ({
   async forwardedJson(response: Response) {
     if (response.status < 200 || response.status >= 300) return null
     return (await response.clone().json()) as Record<string, unknown>
+  },
+}))
+
+vi.mock('@/lib/hardware/byok', () => ({
+  async resolveSubmissionCredential(userId: string, provider: string) {
+    if (fake.state.credentialStoreDown) throw new Error('credential store down')
+    return fake.state.credentials.get(`${userId}:${provider}`) ?? null
   },
 }))
 
@@ -186,6 +200,9 @@ beforeEach(() => {
   fake.state.updateError = null
   fake.state.payloads = new Map()
   fake.state.polls = []
+  fake.state.pollCredentials = []
+  fake.state.credentials = new Map()
+  fake.state.credentialStoreDown = false
   fake.state.gate = null
   __resetReconcileForTests()
   __resetRateLimitForTests()
@@ -453,6 +470,57 @@ describe('what a poll is allowed to write', () => {
     expect(report.skippedMalformed).toBe(1)
     expect(fake.state.polls.every((path) => !path.includes('..'))).toBe(true)
     expect(fake.state.updates.map((u) => u.id)).toEqual(['fine'])
+  })
+})
+
+describe('BYOK jobs', () => {
+  const OWNER = '22222222-2222-4222-8222-222222222222'
+
+  it('polls a user-funded job with its owner\'s stored credential, not the operator\'s', async () => {
+    fake.state.eligible = 2
+    fake.state.rows = [
+      row({ id: 'byok-row', job_id: 'job-byok', user_id: OWNER, credential_owner: 'user' }),
+      row({ id: 'op-row', job_id: 'job-op', credential_owner: 'operator' }),
+    ]
+    const stored = { provider: 'ibm', secret: 'ibm-token' }
+    fake.state.credentials.set(`${OWNER}:ibm`, stored)
+    fake.state.payloads.set('job-byok', { status: 'running' })
+    fake.state.payloads.set('job-op', { status: 'running' })
+
+    const report = await reconcileHardwareJobs()
+
+    expect(report.updated).toBe(2)
+    const byPath = new Map(fake.state.polls.map((p, i) => [p, fake.state.pollCredentials[i]]))
+    expect(byPath.get('/api/hardware/job/ibm/job-byok')).toBe(stored)
+    expect(byPath.get('/api/hardware/job/ibm/job-op')).toBeNull()
+  })
+
+  it('counts a BYOK job unreachable, and never falls back to the operator token, when the credential is gone', async () => {
+    fake.state.eligible = 1
+    fake.state.rows = [
+      row({ id: 'byok-row', job_id: 'job-byok', user_id: OWNER, credential_owner: 'user' }),
+    ]
+    fake.state.payloads.set('job-byok', { status: 'done' })
+
+    const report = await reconcileHardwareJobs()
+
+    expect(report.unreachable).toBe(1)
+    expect(fake.state.polls).toHaveLength(0)
+    expect(fake.state.updates).toHaveLength(0)
+  })
+
+  it('counts a BYOK job unreachable when the credential store is down', async () => {
+    fake.state.eligible = 1
+    fake.state.credentialStoreDown = true
+    fake.state.rows = [
+      row({ id: 'byok-row', job_id: 'job-byok', user_id: OWNER, credential_owner: 'user' }),
+    ]
+    fake.state.payloads.set('job-byok', { status: 'done' })
+
+    const report = await reconcileHardwareJobs()
+
+    expect(report.unreachable).toBe(1)
+    expect(fake.state.polls).toHaveLength(0)
   })
 })
 

@@ -57,7 +57,10 @@ BRAKET_PAYLOAD = {
 #: A complete Azure service-principal payload.
 AZURE_PAYLOAD = {
     "provider": "azure",
-    "resource_id": "/subscriptions/00000000/resourceGroups/rg/providers/Microsoft.Quantum/Workspaces/ws",
+    "resource_id": (
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg"
+        "/providers/Microsoft.Quantum/Workspaces/ws"
+    ),
     "location": "eastus",
     "tenant_id": "11111111-1111-1111-1111-111111111111",
     "client_id": "22222222-2222-2222-2222-222222222222",

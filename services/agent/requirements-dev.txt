@@ -30,4 +30,4 @@
 
 # Build-time only. Pinned to a major line rather than exactly, matching the
 # style of requirements.txt, so security patches arrive without a bump here.
-scikit-learn>=1.4
+scikit-learn>=1.4,<2

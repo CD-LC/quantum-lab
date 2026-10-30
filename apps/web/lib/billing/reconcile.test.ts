@@ -238,6 +238,29 @@ describe('reconcileEntitlement', () => {
     expect(row()?.stripe_subscription_id).toBe('sub_new')
   })
 
+  it('does not keep paid access for an unpaid subscription', async () => {
+    storedRow({ plan_id: 'pro', status: 'active' })
+    // Stripe's `unpaid`: dunning finished, no further charges. It used to map
+    // onto past_due (grace) and so kept Pro for as long as the account existed.
+    stripe.state.byCustomer.set('cus_1', [stripeSub('sub_1', 'price_pro', { status: 'unpaid' })])
+
+    await reconcileEntitlement(USER)
+
+    expect(row()?.status).toBe('canceled')
+  })
+
+  it('prefers a canceled subscription over an unpaid one', async () => {
+    storedRow({ plan_id: 'free' })
+    stripe.state.byCustomer.set('cus_1', [
+      stripeSub('sub_unpaid', 'price_pro', { status: 'unpaid', created: 1_800_000_000 }),
+      stripeSub('sub_canceled', 'price_team', { status: 'canceled', created: 1_700_000_000 }),
+    ])
+
+    await reconcileEntitlement(USER)
+
+    expect(row()?.stripe_subscription_id).toBe('sub_canceled')
+  })
+
   it('writes with a null stamp, so it is never dropped as stale', async () => {
     storedRow({ plan_id: 'free' })
     stripe.state.byCustomer.set('cus_1', [stripeSub('sub_1', 'price_pro')])
@@ -290,6 +313,27 @@ describe('reconcileIfStale', () => {
     expect(row()?.plan_id).toBe('pro')
   })
 
+  it('never re-queries Stripe for a lapsed ex-subscriber', async () => {
+    storedRow({ plan_id: 'pro', status: 'canceled' })
+    stripe.state.byCustomer.set('cus_1', [stripeSub('sub_1', 'price_pro', { status: 'canceled' })])
+    const now = new Date('2025-06-10T00:00:00Z')
+    const longAgo = '2025-01-01T00:00:00Z'
+
+    // The period end of a cancelled row is in the past for good, so the age
+    // test alone matches forever. The status stops it.
+    for (const status of ['canceled', 'none', 'incomplete'] as const) {
+      expect(await reconcileIfStale(USER, longAgo, now, status)).toBe(false)
+    }
+    expect(stripe.state.listCalls).toBe(0)
+
+    // A row that still claims access is the case worth repairing.
+    for (const status of ['active', 'trialing', 'past_due'] as const) {
+      __resetReconcileCooldown()
+      await reconcileIfStale(USER, longAgo, now, status)
+    }
+    expect(stripe.state.listCalls).toBe(3)
+  })
+
   it('does not call Stripe again within the cooldown', async () => {
     storedRow({ plan_id: 'free' })
     stripe.state.byCustomer.set('cus_1', [stripeSub('sub_1', 'price_pro')])
@@ -318,22 +362,51 @@ describe('GET /api/billing/entitlement — the reconciler has a caller', () => {
 
   it('self-heals a subscription whose renewal webhook was missed', async () => {
     db.state.tokens.set('jwt', USER)
-    // The row says the period ended a week ago and the plan lapsed. Stripe says
-    // the customer renewed and is on Pro. Today the product refuses them.
+    // The row says the period ended a week ago and it is still Pro/active. Stripe
+    // says the customer moved to Team. Only a row still claiming access can be
+    // provably behind Stripe, and that is the one worth repairing.
     storedRow({
-      plan_id: 'free',
-      status: 'canceled',
+      plan_id: 'pro',
+      status: 'active',
       current_period_end: new Date(Date.now() - 7 * 86_400_000).toISOString(),
     })
-    stripe.state.byCustomer.set('cus_1', [stripeSub('sub_1', 'price_pro')])
+    stripe.state.byCustomer.set('cus_1', [stripeSub('sub_1', 'price_team')])
 
     const response = await entitlementGET(request(USER, 'jwt'))
     const body = (await response.json()) as { entitlement: { planId: string } }
 
     expect(stripe.state.listCalls).toBe(1)
     // The response reflects the RE-READ row, not the stale one it started with.
-    expect(body.entitlement.planId).toBe('pro')
-    expect(row()?.plan_id).toBe('pro')
+    expect(body.entitlement.planId).toBe('team')
+    expect(row()?.plan_id).toBe('team')
+  })
+
+  it('does not hit Stripe for a lapsed ex-subscriber on every fetch', async () => {
+    db.state.tokens.set('jwt', USER)
+    storedRow({
+      plan_id: 'pro',
+      status: 'canceled',
+      current_period_end: new Date(Date.now() - 90 * 86_400_000).toISOString(),
+    })
+    stripe.state.byCustomer.set('cus_1', [stripeSub('sub_1', 'price_pro', { status: 'canceled' })])
+
+    await entitlementGET(request(USER, 'jwt'))
+    __resetReconcileCooldown()
+    await entitlementGET(request(USER, 'jwt'))
+
+    expect(stripe.state.listCalls).toBe(0)
+  })
+
+  it('tells the UI whether billing exists on this deployment', async () => {
+    db.state.tokens.set('jwt', USER)
+    storedRow({ plan_id: 'free', status: 'none' })
+
+    const response = await entitlementGET(request(USER, 'jwt'))
+    const body = (await response.json()) as { billingEnabled?: boolean }
+
+    // The account page hides "Manage billing" on false, so production (Stripe
+    // off) does not show every user an operator message.
+    expect(body.billingEnabled).toBe(true)
   })
 
   it('does not reconcile for a caller who cannot prove who they are', async () => {
@@ -430,6 +503,36 @@ describe('POST /api/billing/reconcile — who may ask', () => {
     expect(row()?.plan_id).toBe('pro')
   })
 
+  it('does not rate-limit an operator sweep across accounts from one host', async () => {
+    // docs/BILLING.md §8 runs one call per subscriber from one host. Under the
+    // per-IP limit (5/min) the sixth account onwards was refused with a 429 that
+    // `curl -sS` reports as success.
+    const statuses: number[] = []
+    for (let i = 0; i < 8; i += 1) {
+      const id = `33333333-3333-4333-8333-33333333333${i}`
+      const response = await reconcilePOST(post({ userId: id }, { 'x-reconcile-secret': 'operator-secret' }))
+      statuses.push(response.status)
+    }
+    expect(statuses).not.toContain(429)
+  })
+
+  it('still limits an anonymous caller per IP', async () => {
+    const statuses: number[] = []
+    for (let i = 0; i < 7; i += 1) {
+      statuses.push((await reconcilePOST(post({ userId: USER }))).status)
+    }
+    expect(statuses.slice(0, 5)).toEqual([401, 401, 401, 401, 401])
+    expect(statuses.slice(5)).toEqual([429, 429])
+  })
+
+  it('bounds repeated operator calls for one account', async () => {
+    let last = 0
+    for (let i = 0; i < 25; i += 1) {
+      last = (await reconcilePOST(post({ userId: USER }, { 'x-reconcile-secret': 'operator-secret' }))).status
+    }
+    expect(last).toBe(429)
+  })
+
   it('refuses a wrong secret, and one of the wrong length', async () => {
     storedRow({ plan_id: 'free' })
 
@@ -444,6 +547,19 @@ describe('POST /api/billing/reconcile — who may ask', () => {
     // a refusal.
     expect(wrong.status).toBe(401)
     expect(short.status).toBe(401)
+  })
+
+  it('answers 401, not 500, to a secret with multi-byte characters of the same length', async () => {
+    // 'operator-secret' is 15 characters. This is 15 characters too, but 16
+    // bytes in UTF-8: the old character-length guard passed it and
+    // timingSafeEqual then threw a RangeError.
+    const offered = 'operator-secrét'
+    expect(offered.length).toBe('operator-secret'.length)
+    expect(Buffer.byteLength(offered)).not.toBe(Buffer.byteLength('operator-secret'))
+
+    const response = await reconcilePOST(post({ userId: USER }, { 'x-reconcile-secret': offered }))
+
+    expect(response.status).toBe(401)
   })
 
   it('refuses a junk user id before touching anything', async () => {

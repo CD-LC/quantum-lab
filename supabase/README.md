@@ -52,8 +52,10 @@ Open **SQL Editor → New query**, paste the entire contents of
 table, its indexes, row level security policies, and an `updated_at` trigger. The
 script is idempotent, so re-running it is safe.
 
-Then run the other three, in the order in the table below. `schema.sql` alone gives you accounts
-and saved circuits; each later file switches on one more subsystem.
+That alone gives you accounts and saved circuits only. For everything else do NOT run the schema files one
+by one: paste [`apply-all-migrations.sql`](./apply-all-migrations.sql) (all the schema files plus the
+2026-10-22 audit migration, in order, idempotent), or run `supabase db push` to apply `migrations/`. Then
+paste [`verify-migrations.sql`](./verify-migrations.sql); every row must read OK / no rows.
 
 ### Row level security — every table, no exceptions
 
@@ -61,27 +63,40 @@ The `anon` key is public by design, so **RLS is the only thing standing between 
 browser and every row in the database**. Each schema file in this folder enables
 it and writes its own policies:
 
-There are **four** schema files, and they must be run in this order — later ones reuse the
-`set_updated_at()` helper the first defines:
+There are **fifteen** schema files (`schema.sql`, `schema-billing.sql`, `schema-exams.sql`, `schema-orgs.sql`,
+and eleven later ones, ending with `schema-hardening.sql`). They must run in the order
+`scripts/supabase-migrations.sh` lists, because later ones reuse helpers earlier ones define, and
+**`schema-hardening.sql` is not optional**: it stops any signed-in user minting a University org and
+granting themselves EDU entitlement, removes the browser's direct circuit insert, withdraws the anon
+leaderboard grant, and (Part E, audit 2026-10-22) caps seats in the database. Do not hand-pick files:
 
-| # | File | Tables | RLS |
-| --- | --- | --- | --- |
-| 1 | `schema.sql` | `public.circuits` | on — own rows, plus public reads of `is_public` rows |
-| 2 | `schema-billing.sql` | `subscriptions`, `hardware_usage`, `stripe_events`, plus the `reserve_hardware_job()` and `apply_stripe_subscription()` functions | on — read your own row, **no user writes at all** |
-| 3 | `schema-exams.sql` | `exam_attempts`, `exam_certificates` | on — own attempts; certificates are resolved by the public verify route through the service role |
-| 4 | `schema-orgs.sql` | `orgs`, `org_members`, `org_invites`, `org_assignments`, `org_progress_consent`, `org_progress` | on — read your own org, owner/admin writes |
+- **SQL editor:** paste `apply-all-migrations.sql` (everything, in order, idempotent).
+- **CLI:** `supabase db push` applies `migrations/` (including `20261022000040_rls_audit_2026_10_22.sql`).
+
+Then run `verify-migrations.sql`; every row must read OK and the "must return zero rows" queries must be empty.
+
+Highlights of what the files enable, for orientation:
+
+| File | Tables / functions | RLS |
+| --- | --- | --- |
+| `schema.sql` | `public.circuits` | on — own rows, plus public reads of `is_public` rows |
+| `schema-billing.sql` | `subscriptions`, `hardware_usage`, `stripe_events`, `reserve_hardware_job()`, `apply_stripe_subscription()` | on — read your own row, **no user writes at all** |
+| `schema-exams.sql` | `exam_attempts`, `exam_certificates` | on — own attempts; certificates are resolved by the public verify route through the service role |
+| `schema-orgs.sql` | `orgs`, `org_members`, `org_invites`, `org_assignments`, `org_progress_consent`, `org_progress` | on — read your own org, owner/admin writes; invites are written by managers only |
+| `schema-hardening.sql` | `user_progress`, seat-cap and invite-lock triggers | on |
 
 `schema-exams.sql` was added after this README was first written and is easy to miss. Without it
 the exam routes have no store and refuse a start rather than accepting an attempt they could not
 grade — which is the safe direction, but it looks like the exams are broken.
 
+**SECURITY DEFINER functions that take a user id (`spend_in_window`, `reserve_hardware_job*`) are
+`service_role` only.** `DROP FUNCTION` discards grants and `CREATE FUNCTION` hands EXECUTE back to
+PUBLIC (and to anon/authenticated on Supabase), so any file that drops and recreates one must re-apply
+its revokes. `verify-migrations.sql` checks this.
+
 **`subscriptions` has no user write policy at all, and that absence is the entire billing security
 model.** A browser holding the anon key cannot set its own `plan_id`; only the webhook, running
 with the service role, writes that column.
-
-**None of this has been run against a live project.** See the UNVERIFIED banner
-in `schema-orgs.sql`; the same caveat applies to all four files. Item 1 of the
-pre-production checklist in `docs/SECURITY.md` is the test to run.
 
 > **Re-running `schema-orgs.sql` deletes every unclaimed invite.** Deliberately — the old token
 > scheme was forgeable, and hashing those tokens would preserve keys an attacker can compute.

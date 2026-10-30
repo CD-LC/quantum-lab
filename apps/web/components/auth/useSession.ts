@@ -20,6 +20,7 @@
 import { useCallback, useSyncExternalStore } from 'react'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { isSupabaseConfigured } from '@/lib/supabase-config'
+import { authErrorMessage } from './authError'
 
 /**
  * The client, fetched on demand. This hook is in the header of every page, so
@@ -108,11 +109,8 @@ function takeAuthErrorFromUrl(): string | null {
     // ignore
   }
 
-  const raw = (description ?? error ?? code ?? '').replace(/\+/g, ' ')
-  if (code === 'otp_expired' || /expired/i.test(raw)) {
-    return 'That sign-in link has expired or was already used. Request a new one below — links are single-use and valid for a short time.'
-  }
-  return `Sign-in failed: ${raw || code || 'unknown error'}.`
+  // Never echo the URL's own words: they only select a fixed message.
+  return authErrorMessage({ code, error, description })
 }
 
 const NOT_CONFIGURED_MESSAGE =

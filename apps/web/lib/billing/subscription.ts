@@ -51,7 +51,19 @@ export interface EventStamp {
   at: string
 }
 
-/** Map a Stripe subscription status onto our narrower union. */
+/**
+ * Map a Stripe subscription status onto our narrower union.
+ *
+ * `past_due` is the ONLY status that keeps paid access without a payment
+ * (grace for dunning — see `effectivePlan`). `unpaid` used to map onto it too,
+ * and that was wrong: in Stripe, `unpaid` means dunning has FINISHED and the
+ * subscription will not be retried or charged again. The operator's dunning
+ * setting "mark the subscription as unpaid" (the alternative to the default
+ * cancel) leaves it in that state permanently, so an account that stopped
+ * paying kept Pro/Team — the live tutor and real-hardware jobs included — for
+ * as long as it existed, and neither the webhook nor reconcile ever downgraded
+ * it. It is now the end of the subscription, like `canceled`. docs/BILLING.md §6.
+ */
 export function toStatus(status: Stripe.Subscription.Status | string): SubscriptionStatus {
   switch (status) {
     case 'active':
@@ -59,8 +71,8 @@ export function toStatus(status: Stripe.Subscription.Status | string): Subscript
     case 'trialing':
       return 'trialing'
     case 'past_due':
-    case 'unpaid':
       return 'past_due'
+    case 'unpaid':
     case 'canceled':
     case 'paused':
       return 'canceled'

@@ -39,8 +39,15 @@ T = TypeVar("T")
 MAX_QASM_CHARS = 131_072
 
 #: `qreg q[12];` (QASM 2) and `qubit[12] q;` / `bit[12] c;` (QASM 3).
-_QASM2_REGISTER = re.compile(r"\b[qc]reg\s+\w+\s*\[\s*(\d+)\s*\]", re.IGNORECASE)
-_QASM3_REGISTER = re.compile(r"\b(?:qubit|bit)\s*\[\s*(\d+)\s*\]", re.IGNORECASE)
+#:
+#: The size is captured as ANY text up to the closing bracket, not just digits:
+#: OpenQASM 3 also accepts ``100_000``, ``0x186A0`` and ``50000*2``, and a guard
+#: that only recognised plain digits skipped those entirely (a ~90-byte
+#: ``qubit[4_000_000] q;`` then OOM-killed the replica). Anything that is not a
+#: plain decimal literal is treated as over the limit rather than evaluated.
+_QASM2_REGISTER = re.compile(r"\b[qc]reg\s+\w+\s*\[([^\]]*)\]", re.IGNORECASE)
+_QASM3_REGISTER = re.compile(r"\b(?:qubit|bit)\s*\[([^\]]*)\]", re.IGNORECASE)
+_PLAIN_DECIMAL = re.compile(r"\d{1,12}")
 
 
 def guard_qasm(qasm: str, max_qubits: int | None = None) -> None:
@@ -70,11 +77,13 @@ def guard_qasm(qasm: str, max_qubits: int | None = None) -> None:
     limit = settings.max_qubits if max_qubits is None else min(max_qubits, settings.max_qubits)
     for pattern in (_QASM2_REGISTER, _QASM3_REGISTER):
         for match in pattern.finditer(qasm):
-            digits = match.group(1)
-            # A very long digit run is over the limit by definition, and int()
-            # on >4300 digits raises ValueError in Python 3.11+ (the int/str
-            # conversion guard) which would surface as a 500 rather than a 400.
-            declared = int(digits) if len(digits) <= 12 else limit + 1
+            size = match.group(1).strip()
+            # A plain decimal is compared exactly. Anything else (a very long
+            # digit run, underscores, hex/octal/binary, an expression, a
+            # constant name) cannot be evaluated cheaply here, so it is over
+            # the limit by definition. int() on >4300 digits would also raise
+            # ValueError in Python 3.11+ and surface as a 500 rather than a 400.
+            declared = int(size) if _PLAIN_DECIMAL.fullmatch(size) else limit + 1
             if declared > limit:
                 raise HTTPException(
                     status_code=400,

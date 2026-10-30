@@ -1,5 +1,7 @@
 import type { Metadata } from 'next'
 import Link from 'next/link'
+import { headers } from 'next/headers'
+import { notFound } from 'next/navigation'
 import { cache } from 'react'
 import { lookupCertificate } from '@/lib/exams/service'
 import {
@@ -8,6 +10,7 @@ import {
   type VerifiedCertificateFacts,
 } from '@/lib/certificate'
 import { absoluteUrl, pageMetadata } from '@/lib/seo'
+import { allowVerifyLookup, decodeCertificateSegment } from './guard'
 
 /**
  * /verify/[certificateId] — the public proof.
@@ -40,10 +43,20 @@ interface PageProps {
 
 /**
  * One lookup per request, shared between `generateMetadata` and the page —
- * without `cache` the same certificate row would be read twice per render.
+ * without `cache` the same certificate row would be read twice per render, and
+ * the rate limiter would count the render twice.
+ *
+ * Returns `null` when the caller has used up the same per-minute allowance the
+ * API route enforces; the page renders a "try again shortly" card for that.
+ * A segment that is not valid percent-encoding is a 404, not a server error.
  */
-const getVerification = cache((certificateId: string) =>
-  lookupCertificate(decodeURIComponent(certificateId))
+const getVerification = cache(
+  async (segment: string): Promise<Awaited<ReturnType<typeof lookupCertificate>> | null> => {
+    const certificateId = decodeCertificateSegment(segment)
+    if (certificateId === null) notFound()
+    if (!(await allowVerifyLookup(await headers()))) return null
+    return lookupCertificate(certificateId)
+  }
 )
 
 /**
@@ -58,17 +71,25 @@ const getVerification = cache((certificateId: string) =>
 export async function generateMetadata(props: PageProps): Promise<Metadata> {
   const params = await props.params;
   const result = await getVerification(params.certificateId)
+  if (!result) {
+    return pageMetadata({
+      title: 'Verify a certificate',
+      description: 'Verify a Qubit16 certification number.',
+      path: '/verify',
+      noIndex: true,
+    })
+  }
   const verified = result.valid && result.examTitle
   return pageMetadata({
     title: verified
       ? `${result.examTitle} — verified certificate`
-      : `Certificate ${params.certificateId}`,
+      : `Certificate ${result.id}`,
     description: verified
       ? `A verified Qubit16 certification, issued ${
           result.issuedAt ? formatCertificateDate(result.issuedAt) : 'on record'
         }. Number ${result.id}.`
       : 'Verify a Qubit16 certification number.',
-    path: `/verify/${params.certificateId}`,
+    path: `/verify/${encodeURIComponent(result.id)}`,
     noIndex: true,
   })
 }
@@ -76,6 +97,26 @@ export async function generateMetadata(props: PageProps): Promise<Metadata> {
 export default async function VerifyPage(props: PageProps) {
   const params = await props.params;
   const result = await getVerification(params.certificateId)
+
+  if (!result) {
+    return (
+      <div className="mx-auto max-w-2xl px-6 py-16">
+        <p className="section-label">Verification</p>
+        <section className="card mt-3 border-q-amber/50 p-6 md:p-8" aria-label="Too many lookups">
+          <h1 className="section-title text-2xl text-q-amber-text">Try again shortly</h1>
+          <p className="mt-3 text-sm leading-relaxed text-ink-secondary">
+            There have been a lot of certificate lookups from your connection in the last minute.
+            Wait a moment and reload this page. This is not a statement about the certificate.
+          </p>
+        </section>
+        <div className="mt-6 flex flex-wrap gap-3">
+          <Link href="/verify" className="btn-ghost focus-ring">
+            Check another number
+          </Link>
+        </div>
+      </div>
+    )
+  }
 
   // The share affordances need every fact they embed; a valid-but-retired
   // record with no exam title still gets them, named by its catalogue id.

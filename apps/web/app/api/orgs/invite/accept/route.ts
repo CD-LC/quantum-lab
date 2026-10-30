@@ -35,21 +35,20 @@
 
 import { NextResponse } from 'next/server'
 import {
-  addMember,
+  claimSeat,
   getOrg,
   getInviteByToken,
   isSeatLimitError,
   listMembers,
   markInviteAccepted,
-  seatUsage,
-  setMemberStatus,
+  releaseInvite,
 } from '@/lib/orgs/store'
 import { isInviteAccepted, isInviteExpired, isInviteToken } from '@/lib/orgs/invites'
 import { inviteLookupContext } from '@/lib/orgs/access'
 import { isSupabaseConfigured } from '@/lib/supabase'
 import { SIGN_IN_REQUIRED, verifiedCaller } from '@/lib/security/auth'
 import { check, clientKey, retryHeaders } from '@/lib/security/ratelimit'
-import { isRecord, safeJson, str } from '@/lib/security/validate'
+import { isRecord, readJsonBody, str } from '@/lib/security/validate'
 import { apiError, errorForStatus } from '@/lib/apiError'
 import { reportError } from '@/lib/observability/report'
 
@@ -80,7 +79,8 @@ export async function POST(req: Request): Promise<Response> {
     })
   }
 
-  const parsed = safeJson(await req.text(), 4_096)
+  const parsed = await readJsonBody(req, 4_096)
+  if (!parsed.ok && parsed.tooLarge) return apiError('payload_too_large')
   if (!parsed.ok) return bad(parsed.error, 400)
   if (!isRecord(parsed.value)) return bad('Expected a JSON object.', 400)
 
@@ -144,24 +144,17 @@ export async function POST(req: Request): Promise<Response> {
     const org = await getOrg(invite.orgId, ctx)
     if (!org) return bad(NOT_VALID, 404)
 
-    // Capacity, checked here for the same reason /api/orgs/members checks it:
-    // the store's SeatLimitError is a courtesy the caller can skip.
-    const seats = await seatUsage(invite.orgId, ctx)
+    // Capacity is enforced by claimSeat (SeatLimitError, with a post-write
+    // re-count). A held seat is converted, not added, so no new capacity here.
     const members = await listMembers(invite.orgId, ctx)
     const held = members.find((m) => m.email.toLowerCase() === callerEmail)
-    // A seat already held for this address (the 'invited' row minted with the
-    // link) is being converted, not added, so it does not need new capacity.
-    if (!held && Number.isFinite(seats.total) && seats.used >= seats.total) {
-      return NextResponse.json(
-        {
-          error: 'Every seat on this licence is in use. Ask an admin to free one.',
-          code: 'conflict',
-          seatsUsed: seats.used,
-          seatsTotal: seats.total,
-        },
-        { status: 409 }
-      )
-    }
+    // The invite is only good while the seat minted with it is still held.
+    // POST /api/orgs/invite always creates the 'invited' seat alongside the
+    // token, so a missing seat means an admin removed the pending invitee, and
+    // a suspended one means an admin shut that seat. Neither may be revived by
+    // an old link, and the role comes from the seat, which an admin may have
+    // changed since the invite was minted. Same sentence as any dead link.
+    if (!held || held.status === 'suspended') return bad(NOT_VALID, 404)
 
     // (5) Burn first, write second. If this loses the race it returns false and
     // nothing is written — better a claim that has to be retried than two seats
@@ -170,9 +163,31 @@ export async function POST(req: Request): Promise<Response> {
     if (!burned) return bad(NOT_VALID, 404)
 
     // The role comes from the INVITE ROW, never from the request.
-    const member = held
-      ? ((await setMemberStatus(invite.orgId, held.id, 'active', ctx)) ?? held)
-      : await addMember(invite.orgId, invite.email, invite.role, 'active', ctx)
+    //
+    // FIX (invite acceptance): the seat is BOUND TO THE ACCOUNT, not merely
+    // flipped to 'active'. Every authorisation check keys on
+    // `org_members.user_id` — requireOrgRole, getEntitlement, the RLS helper
+    // is_org_member, the progress routes — and an invited seat is held by
+    // email with user_id NULL. Writing only `status` left every invitee with a
+    // green seat they could not use: 403 from every /api/orgs route and a Free
+    // entitlement. `caller.id` is the Supabase-verified account whose email
+    // matched the invite in step (4); nothing from the request body names it.
+    let member: Awaited<ReturnType<typeof claimSeat>> = null
+    try {
+      member = await claimSeat(invite.orgId, held.id, caller.id, ctx)
+    } catch (claimErr) {
+      // The invite was burned above. Hand it back so the invitee is not left
+      // with a dead link after a failed claim (licence filled concurrently,
+      // transient database error), then let the handler report the failure.
+      await releaseInvite(invite.id, ctx)
+      throw claimErr
+    }
+    // A null here means the bind did not happen. Reporting success would be
+    // the exact bug this fixes, so say so, and keep the link usable.
+    if (!member) {
+      await releaseInvite(invite.id, ctx)
+      return bad('Could not claim that seat. Try again in a moment.', 500)
+    }
 
     return NextResponse.json({ member, org }, { status: 200 })
   } catch (err) {

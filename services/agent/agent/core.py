@@ -215,10 +215,22 @@ def _clean_override(llm: LlmOverride | None) -> LlmOverride | None:
     return out
 
 
+def _escape_template_braces(text: str) -> str:
+    """Escape ``{`` and ``}`` so a prompt template treats them as literal text.
+
+    ``ChatPromptTemplate`` parses every ``(role, string)`` message as an
+    f-string template. The system prompt embeds the learner's circuit, and QASM
+    is full of braces (``gate g a { h a; }``), each of which would be read as a
+    template variable and fail with a ``KeyError`` at invoke time.
+    """
+    return text.replace("{", "{{").replace("}", "}}")
+
+
 def build_agent(
     level: str = "beginner",
     circuit_qasm: str | None = None,
     llm_override: LlmOverride | None = None,
+    learner_plan: str | None = None,
 ) -> Any:
     """Construct a tool-calling ``AgentExecutor`` for a tutoring session.
 
@@ -268,6 +280,11 @@ def build_agent(
         "model": settings.model,
         "max_tokens": settings.max_tokens,
         "temperature": settings.temperature,
+        # LiteLLM's own default is 600 s per call; a stalled provider would pin
+        # a worker thread that long. Never longer than the run budget.
+        "request_timeout": min(
+            float(settings.llm_request_timeout), float(settings.max_agent_seconds)
+        ),
     }
     if override is not None:
         llm_kwargs["model"] = override["model"]
@@ -282,11 +299,15 @@ def build_agent(
         [
             (
                 "system",
-                build_system_prompt(level=level, circuit_qasm=circuit_qasm)
-                + "\n\n"
-                + debug_loop_guidance()
-                + "\n\n"
-                + run_paper_guidance(),
+                _escape_template_braces(
+                    build_system_prompt(
+                        level=level, circuit_qasm=circuit_qasm, learner_plan=learner_plan
+                    )
+                    + "\n\n"
+                    + debug_loop_guidance()
+                    + "\n\n"
+                    + run_paper_guidance()
+                ),
             ),
             MessagesPlaceholder("chat_history", optional=True),
             ("human", "{input}"),
@@ -337,6 +358,7 @@ def ask(
     history: list[dict[str, str]] | None = None,
     circuit_qasm: str | None = None,
     llm_override: LlmOverride | None = None,
+    learner_plan: str | None = None,
 ) -> dict[str, Any]:
     """Ask QuantumMind a question and get its reply plus the tools it used.
 
@@ -346,6 +368,8 @@ def ask(
         history: Prior turns as ``{"role": "user"|"assistant", "content": str}``
             dicts, oldest first.
         circuit_qasm: OpenQASM the learner currently has open, if any.
+        llm_override: Provider/key choice forwarded by the web app, if any.
+        learner_plan: Study plan the learner opted in to sharing, if any.
 
     Returns:
         ``{"reply": str, "tools_used": list[str]}``.
@@ -354,7 +378,12 @@ def ask(
         RuntimeError: If the service is not configured (no API key or missing
             LangChain dependencies).
     """
-    executor = build_agent(level=level, circuit_qasm=circuit_qasm, llm_override=llm_override)
+    executor = build_agent(
+        level=level,
+        circuit_qasm=circuit_qasm,
+        llm_override=llm_override,
+        learner_plan=clamp_text(learner_plan) if learner_plan else None,
+    )
 
     from langchain_core.messages import AIMessage, HumanMessage
 

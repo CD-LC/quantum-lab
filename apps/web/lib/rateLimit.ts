@@ -164,17 +164,53 @@ interface Bucket {
   /** Window index; the map key carries it too, this catches a stale entry. */
   window: number
   count: number
+  /** Epoch ms at which this bucket's window ends; after that it is garbage. */
+  expiresAt: number
+  /** Window length, so eviction can tell a per-minute key from a daily quota. */
+  windowMs: number
 }
 
 /**
  * Keys are never swept on a timer — a `setInterval` in a serverless function is
  * a leak with no owner. A bucket is replaced lazily when its window rolls, and
- * the whole map is dropped past MAX_KEYS. Dropping everything is crude; the
- * failure mode is "some callers briefly get a fresh allowance", which is the
- * right direction to fail for a store that is already advisory.
+ * when the map reaches MAX_KEYS `makeRoom` evicts entries: expired windows
+ * first, then the OLDEST short-window keys, and only as a last resort the
+ * oldest long-window keys. It never clears the map.
+ *
+ * Clearing everything (what this did before) is not "some callers briefly get a
+ * fresh allowance": the same map holds the 24-hour LLM cost quotas, so a flush
+ * handed every caller a brand-new daily allowance, and 10 000 cheap one-minute
+ * keys are reached within hours on ordinary traffic. Per-minute keys are
+ * disposable (they expire in a minute); daily quota keys are what must survive.
  */
 const MAX_KEYS = 10_000
+/** Evict down to this many entries so the O(n) pass is amortised, not per request. */
+const EVICT_TO = Math.floor(MAX_KEYS * 0.9)
+/** A window at least this long is a cost quota (daily/hourly), kept longest. */
+const LONG_WINDOW_MS = 3_600_000
 const buckets = new Map<string, Bucket>()
+
+function makeRoom(now: number): void {
+  // 1. Expired windows are free to drop; they can never be read again.
+  for (const [k, b] of buckets) {
+    if (b.expiresAt <= now) buckets.delete(k)
+  }
+  if (buckets.size < MAX_KEYS) return
+
+  // 2. Still full of live keys: drop the oldest short-window ones first
+  //    (Map iteration order is insertion order).
+  for (const [k, b] of buckets) {
+    if (buckets.size <= EVICT_TO) break
+    if (b.windowMs < LONG_WINDOW_MS) buckets.delete(k)
+  }
+  if (buckets.size < MAX_KEYS) return
+
+  // 3. Nothing but long windows left: drop the oldest of those.
+  for (const k of buckets.keys()) {
+    if (buckets.size <= EVICT_TO) break
+    buckets.delete(k)
+  }
+}
 
 function countInMemory(key: string, rule: RateLimitRule, now: number): RateLimitDecision {
   const window = windowIndex(now, rule.windowMs)
@@ -183,8 +219,8 @@ function countInMemory(key: string, rule: RateLimitRule, now: number): RateLimit
   const existing = buckets.get(mapKey)
 
   if (!existing || existing.window !== window) {
-    if (buckets.size >= MAX_KEYS) buckets.clear()
-    buckets.set(mapKey, { window, count: 1 })
+    if (!existing && buckets.size >= MAX_KEYS) makeRoom(now)
+    buckets.set(mapKey, { window, count: 1, expiresAt: resetAt, windowMs: rule.windowMs })
     return { allowed: true, remaining: rule.limit - 1, resetAt, store: 'memory' }
   }
 
@@ -371,7 +407,7 @@ export function callerKey(headers: Headers, prefix: string, subject?: string | n
 }
 
 /** IPv6 → its /64 prefix; anything else (IPv4, junk) unchanged. */
-function normaliseAddress(address: string): string {
+export function normaliseAddress(address: string): string {
   // Strip a bracketed/ported form like [2001:db8::1]:443 before anything else.
   const bare = address.startsWith('[') ? address.slice(1).split(']')[0] ?? address : address
   if (!bare.includes(':')) return bare

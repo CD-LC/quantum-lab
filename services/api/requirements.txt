@@ -1,9 +1,9 @@
-fastapi>=0.110
-uvicorn[standard]>=0.27
-pydantic>=2
-pydantic-settings>=2
-qiskit>=1.0
-qiskit-aer>=0.14
+fastapi>=0.110,<1
+uvicorn[standard]>=0.27,<1
+pydantic>=2,<3
+pydantic-settings>=2,<3
+qiskit>=1.0,<3
+qiskit-aer>=0.14,<1
 # NOT optional, despite being an "extra" in Qiskit's own docs. Every circuit
 # apps/web/lib/quantum.ts exports writes rotation angles as exact fractions of
 # pi ("ry(pi/3)"), which is also what qiskit.qasm3.dumps emits. Without this
@@ -13,12 +13,12 @@ qiskit-aer>=0.14
 # the teleportation preset outright and the hardware page cannot cost or run
 # it. tests/test_js_crosscheck.py::test_the_qasm3_importer_is_a_required_dependency
 # fails if this line is removed.
-qiskit-qasm3-import>=0.5
-pennylane>=0.40
-pennylane-lightning>=0.40
-python-dotenv>=1.0
-httpx>=0.27
-pytest>=8.0
+qiskit-qasm3-import>=0.5,<1
+pennylane>=0.40,<1
+pennylane-lightning>=0.40,<1
+python-dotenv>=1.0,<2
+httpx>=0.27,<1
+pytest>=8.0,<10
 
 # ---------------------------------------------------------------------------
 # DURABILITY: shared job store + long-term job history
@@ -31,8 +31,8 @@ pytest>=8.0
 # to work the moment they're set on a deploy, without also remembering to add
 # a pip package at the same time — see infra/azure/deploy.sh's
 # ENABLE_MILESTONE_WORKLOADS section, which sets exactly these two.
-redis>=5.0                 # multi-process job store (REDIS_URL) — app/jobs/store.py
-psycopg[pool,binary]>=3.1  # durable job history (DATABASE_URL) — app/jobs/archive.py
+redis>=5.0,<9                 # multi-process job store (REDIS_URL) — app/jobs/store.py
+psycopg[pool,binary]>=3.1,<4  # durable job history (DATABASE_URL) — app/jobs/archive.py
 
 # ---------------------------------------------------------------------------
 # OPTIONAL EXTRAS

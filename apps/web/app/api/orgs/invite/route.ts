@@ -18,6 +18,7 @@ import {
   getInviteByToken,
   getOrg,
   isSeatLimitError,
+  listMembers,
   seatUsage,
 } from '@/lib/orgs/store'
 import {
@@ -28,6 +29,7 @@ import {
   isInviteExpired,
   isInviteToken,
   isPlausibleEmail,
+  mailSafeOrgName,
   mintInviteToken,
 } from '@/lib/orgs/invites'
 import { isOrgRole, type OrgInvite } from '@/lib/orgs/types'
@@ -42,7 +44,8 @@ import {
   requireOrgRole,
 } from '@/lib/orgs/access'
 import { check, clientKey, retryHeaders } from '@/lib/security/ratelimit'
-import { email as validEmail, safeJson, str } from '@/lib/security/validate'
+import { callerKey, rateLimit, retryAfterHeaders } from '@/lib/rateLimit'
+import { email as validEmail, readJsonBody, str } from '@/lib/security/validate'
 import { apiError, errorForStatus } from '@/lib/apiError'
 import { reportError } from '@/lib/observability/report'
 
@@ -122,7 +125,8 @@ export async function POST(req: Request): Promise<Response> {
   }
 
   // SECURITY FIX (audit finding VAL-1): byte-capped parse instead of req.json().
-  const parsed = safeJson(await req.text(), 8_192)
+  const parsed = await readJsonBody(req, 8_192)
+  if (!parsed.ok && parsed.tooLarge) return apiError('payload_too_large')
   if (!parsed.ok) return bad(parsed.error, 400)
   const body: unknown = parsed.value
   if (!isRecord(body)) return bad('Expected a JSON object.', 400)
@@ -172,6 +176,41 @@ export async function POST(req: Request): Promise<Response> {
       )
     }
 
+    // Mail-relay guards (audit finding MAIL-1, org-name half). Both limits use
+    // the SHARED limiter, keyed on the verified caller and on the target
+    // address, so neither resets on a cold start or spans instances:
+    //   • per inviter: a manager can mint a few dozen invitations an hour;
+    //   • per recipient address: the same mailbox is mailed at most 3 times a
+    //     day from this product, whoever asks, so a Team org cannot be used to
+    //     hammer one third party.
+    // A resend to an address that already holds a seat is legitimate and is
+    // allowed within those caps; mail is never sent to a seat that is already
+    // active (nothing to accept), and the response still carries the link.
+    const perCaller = await rateLimit(callerKey(req.headers, 'orgs-invite-mail', callerId), {
+      limit: 30,
+      windowMs: 60 * 60_000,
+    })
+    if (!perCaller.allowed) {
+      return apiError('rate_limited', {
+        message: 'Too many invitations sent recently. Try again later.',
+        headers: retryAfterHeaders(perCaller),
+      })
+    }
+    const perRecipient = await rateLimit(`orgs-invite-to:${email.toLowerCase()}`, {
+      limit: 3,
+      windowMs: 24 * 60 * 60_000,
+    })
+    if (!perRecipient.allowed) {
+      return apiError('rate_limited', {
+        message: 'That address has already been sent several invitations today.',
+        headers: retryAfterHeaders(perRecipient),
+      })
+    }
+
+    const existing = (await listMembers(orgId, ctx)).find(
+      (m) => m.email.toLowerCase() === email.toLowerCase()
+    )
+
     // Holding the seat and issuing the token are one action from the admin's
     // point of view, so they happen together.
     const member = await addMember(orgId, email, role, 'invited', ctx)
@@ -194,18 +233,21 @@ export async function POST(req: Request): Promise<Response> {
     // the provider is down, so a delivery failure never invalidates a perfectly
     // good invite — the copyable `url` above remains the fallback.
     const message = orgInvite({
-      orgName: org.name,
+      orgName: mailSafeOrgName(org.name),
       inviterEmail: 'An administrator',
       role,
       acceptUrl: url,
       expiresInDays: INVITE_TTL_DAYS,
     })
-    const delivery = await sendEmail({
-      to: email,
-      subject: message.subject,
-      html: message.html,
-      text: message.text,
-    })
+    const delivery =
+      existing?.status === 'active'
+        ? ({ sent: false, reason: 'already_member' } as const)
+        : await sendEmail({
+            to: email,
+            subject: message.subject,
+            html: message.html,
+            text: message.text,
+          })
 
     return NextResponse.json(
       {

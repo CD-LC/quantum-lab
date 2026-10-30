@@ -27,6 +27,7 @@ import { announce } from '@/lib/a11y/announce'
 import { columnProbeReadout, describeColumnProbe } from '@/lib/column-probe'
 import { insertOpAt, moveOp, removeOpAt, retargetOp } from '@/lib/quantum/circuitEdit'
 import ColumnProbe from './ColumnProbe'
+import { postselectPlacementProblem } from './postselectGuard'
 import {
   BlockEditor,
   DEFAULT_BLOCK_DRAFT,
@@ -380,7 +381,7 @@ export default function CircuitGrid({
    * rather than producing an op the engine will throw on.
    */
   const buildOp = useCallback(
-    (qubits: number[]): GateOp | string => {
+    (qubits: number[], atIndex: number = circuit.ops.length): GateOp | string => {
       if (!selectedGate) return 'Choose a gate first.'
       const spec = GATE_BY_NAME[selectedGate]
       if (!spec) return `Unknown gate ${selectedGate}.`
@@ -412,11 +413,19 @@ export default function CircuitGrid({
       if (classicalControl && selectedGate === 'MEASURE') {
         return { ...op, clbit: Math.min(measureClbit, numClbits - 1) }
       }
-      return activeCondition && selectedGate !== 'BARRIER' ? { ...op, condition: activeCondition } : op
+      const placed = activeCondition && selectedGate !== 'BARRIER' ? { ...op, condition: activeCondition } : op
+      // A postselect on an outcome that cannot happen at that point would leave
+      // a circuit with no state to show: refuse it out loud, like the drafts above.
+      if (selectedGate === 'POSTSELECT') {
+        const problem = postselectPlacementProblem(circuit, placed, atIndex)
+        if (problem) return problem
+      }
+      return placed
     },
     [
       activeCondition,
       blockDraft,
+      circuit,
       circuit.numQubits,
       classicalControl,
       extraControlsDraft,
@@ -505,12 +514,12 @@ export default function CircuitGrid({
       const arity = spec.variadic || selectedGate === 'BARRIER' ? effectiveArity(selectedGate, drafts) : spec.arity
 
       if (arity <= 1) {
-        const op = buildOp(arity === 0 ? [] : [q])
+        const insertIndex = Math.min(Math.max(atCol, 0), circuit.ops.length)
+        const op = buildOp(arity === 0 ? [] : [q], insertIndex)
         if (typeof op === 'string') {
           announce(op)
           return
         }
-        const insertIndex = Math.min(Math.max(atCol, 0), circuit.ops.length)
         onChange(insertOpAt(circuit, insertIndex, op))
         setPending([])
         announce(

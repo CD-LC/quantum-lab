@@ -27,7 +27,8 @@
  * credential requires an account, and `issueCertificate` refuses a guest.
  */
 
-import { verifiedCaller } from '@/lib/security/auth'
+import { apiError } from '@/lib/apiError'
+import { verifyCallerOutcome } from '@/lib/security/auth'
 import type { AttemptSubject } from './types'
 
 const GUEST_COOKIE = 'ql_exam_guest'
@@ -45,9 +46,27 @@ function readCookie(req: Request, name: string): string | null {
     const eq = part.indexOf('=')
     if (eq === -1) continue
     if (part.slice(0, eq).trim() !== name) continue
-    return decodeURIComponent(part.slice(eq + 1).trim())
+    const raw = part.slice(eq + 1).trim()
+    try {
+      return decodeURIComponent(raw)
+    } catch {
+      // A malformed escape (`%E0%A4%A`, a lone `%`) is a cookie we did not
+      // write. It must read as "no cookie" — a 500 on every exam route for
+      // anyone whose browser or a proxy mangled the header is not acceptable.
+      continue
+    }
   }
   return null
+}
+
+function isHttps(req: Request): boolean {
+  const forwarded = req.headers.get('x-forwarded-proto')
+  if (forwarded) return forwarded.split(',')[0]?.trim().toLowerCase() === 'https'
+  try {
+    return new URL(req.url).protocol === 'https:'
+  } catch {
+    return false
+  }
 }
 
 function newGuestId(): string {
@@ -60,6 +79,36 @@ export interface ResolvedSubject {
   subject: AttemptSubject
   /** Set when a new guest cookie has to be sent back with the response. */
   setCookie?: string
+  /**
+   * Set when the caller PRESENTED an access token that could not be accepted.
+   * A route MUST return this response instead of carrying on:
+   *
+   *   · 401 — the auth service said the token is expired, revoked or forged.
+   *     The client refreshes its session and retries.
+   *   · 503 (with Retry-After) — the auth service could not be reached. The
+   *     token may be fine; the client retries.
+   *
+   * Carrying on is exactly the bug this field exists to prevent: a signed-in
+   * candidate would be dealt a guest attempt that can never become a
+   * certificate, and a later request would 404 on their own attempt. `subject`
+   * is still populated (as a guest) only so a caller that has not yet been
+   * taught to check this field behaves as it always did rather than crashing.
+   */
+  denied?: Response
+}
+
+/** The 401/503 for a presented token that did not verify. Fresh each call. */
+function deniedResponse(kind: 'invalid' | 'unavailable'): Response {
+  if (kind === 'invalid') {
+    return apiError('unauthorized', {
+      message: 'Your session has expired or is no longer valid. Sign in again to continue.',
+    })
+  }
+  return apiError('upstream_unavailable', {
+    status: 503,
+    message: 'We could not check your sign-in just now. Try again in a moment.',
+    headers: { 'Retry-After': '5' },
+  })
 }
 
 /**
@@ -71,21 +120,31 @@ export interface ResolvedSubject {
  * under an identity that was anonymous when the questions were answered.
  */
 export async function resolveSubject(req: Request): Promise<ResolvedSubject> {
-  const caller = await verifiedCaller(req)
-  if (caller) return { subject: { kind: 'user', id: caller.id } }
+  const outcome = await verifyCallerOutcome(req)
+  if (outcome.kind === 'ok') return { subject: { kind: 'user', id: outcome.caller.id } }
+
+  // A token was presented and could not be accepted. Not the same as no token:
+  // see `ResolvedSubject.denied`.
+  const denied =
+    outcome.kind === 'invalid' || outcome.kind === 'unavailable'
+      ? deniedResponse(outcome.kind)
+      : undefined
 
   const existing = readCookie(req, GUEST_COOKIE)
   if (existing && GUEST_ID.test(existing)) {
-    return { subject: { kind: 'guest', id: existing } }
+    return { subject: { kind: 'guest', id: existing }, ...(denied ? { denied } : {}) }
   }
 
   const id = newGuestId()
-  // `secure` is omitted deliberately: this cookie has to work on
-  // http://localhost during development, and it protects a practice session,
-  // not a credential. SameSite=Lax is enough to keep it off cross-site
-  // requests; httpOnly keeps it out of any script that manages to run.
-  const setCookie = `${GUEST_COOKIE}=${id}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${GUEST_COOKIE_MAX_AGE}`
-  return { subject: { kind: 'guest', id }, setCookie }
+  // `Secure` is added whenever the request arrived over https (directly or via
+  // the proxy's x-forwarded-proto), so the one-year identity never travels in
+  // plaintext in production. It is left off for plain http://localhost, where a
+  // Secure cookie would be dropped and guest mode would stop working in
+  // development. SameSite=Lax keeps it off cross-site requests; httpOnly keeps
+  // it out of any script that manages to run.
+  const secure = isHttps(req) ? '; Secure' : ''
+  const setCookie = `${GUEST_COOKIE}=${id}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${GUEST_COOKIE_MAX_AGE}${secure}`
+  return { subject: { kind: 'guest', id }, setCookie, ...(denied ? { denied } : {}) }
 }
 
 /** Attach a pending guest cookie to a response. No-op when there is none. */

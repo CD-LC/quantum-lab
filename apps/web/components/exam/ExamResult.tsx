@@ -368,6 +368,9 @@ export function ExamResult({ exam, result, notice, onRetry, onCertificate }: Exa
           <p className="mt-1 text-[13px] text-ink-secondary">
             A new attempt draws a different set of questions from the pool, in a different order.
             Your best score is kept.
+            {result.retakeAvailableAt
+              ? ` After a paper that does not pass there is a short wait: you can sit again from ${new Date(result.retakeAvailableAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}.`
+              : ''}
           </p>
         </div>
         <div className="flex flex-wrap gap-2">

@@ -60,3 +60,19 @@ MAX_NOISY_QUBITS = 12
 #: renders; the response is JSON, so the wire cost is the binding constraint
 #: long before the simulation is.
 MAX_STATEVECTOR_QUBITS = 12
+
+
+#: Hard ceiling on a PARSED circuit's width, independent of any per-backend cap.
+#: ``guard_qasm`` bounds the declared width before parsing; this is the second
+#: line of defence for a register size the source-text guard could not evaluate.
+#: Real devices top out near 160 qubits, so 1024 never refuses a real circuit.
+MAX_PARSED_QUBITS = 1024
+
+#: Hard ceiling on the number of primitive operations a parsed circuit expands
+#: to once nested ``gate`` definitions are unrolled. OpenQASM 3 gate definitions
+#: may call one another, so 15 doubling definitions in ~660 bytes expand to
+#: 2^17 operations (measured: 133 s in ``transpile``). A flat 128 KiB source
+#: holds at most ~26k of the shortest statements, and the noise suite's
+#: 11,499-gate chain with a barrier after each gate is ~23k operations, so
+#: 40,000 never refuses honest input while still sitting well below the tower.
+MAX_EXPANDED_OPERATIONS = 40_000

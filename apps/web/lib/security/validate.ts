@@ -175,9 +175,10 @@ export function httpUrl(
  * Parse JSON with a hard byte ceiling and no throwing.
  *
  * `JSON.parse` on an unbounded body is a denial-of-service primitive: the
- * string is already in memory, and the parse allocates again. Callers should
- * read the body as text (bounded by the platform's own limit), then hand it
- * here with a limit appropriate to the route.
+ * string is already in memory, and the parse allocates again. This function
+ * only sees a string that is ALREADY buffered, so for a request body use
+ * `readJsonBody`/`readBodyText`, which enforce the cap while reading. Use
+ * `safeJson` directly only for text that came from somewhere already bounded.
  *
  * Byte length is measured with TextEncoder, not `String.length`, because a body
  * of astral-plane characters is up to four bytes per code point.
@@ -193,6 +194,88 @@ export function safeJson(text: string, maxBytes: number): Result<unknown> {
   } catch {
     return fail('Request body must be valid JSON.')
   }
+}
+
+/** A failed bounded read. `tooLarge` lets a route answer 413 instead of 400. */
+export type BodyInvalid = Invalid & { tooLarge: boolean }
+
+function bodyFail(error: string, tooLarge = false): BodyInvalid {
+  return { ok: false, error, tooLarge }
+}
+
+function tooLargeMessage(maxBytes: number): string {
+  return `Request body must be at most ${maxBytes} bytes.`
+}
+
+/**
+ * Read a request body as text, enforcing `maxBytes` WHILE READING.
+ *
+ * `await req.text()` followed by `safeJson` measures the body only after the
+ * whole thing is already in memory, so the cap protects the parser and nothing
+ * else: several concurrent multi-megabyte POSTs would still be buffered in full
+ * by a 0.5 GiB replica. This does it in the order that bounds memory:
+ *
+ *   1. A declared `Content-Length` over the cap is refused before a byte is read.
+ *   2. Otherwise the stream is read chunk by chunk with a running total, and the
+ *      read is cancelled the moment the total passes the cap, so an attacker who
+ *      lies about (or omits) the length, or sends chunked, buffers at most
+ *      `maxBytes` plus one chunk.
+ *
+ * Never throws: a failed or aborted stream is a normal failure result.
+ */
+export async function readBodyText(
+  req: Request,
+  maxBytes: number
+): Promise<Valid<string> | BodyInvalid> {
+  const declared = req.headers.get('content-length')
+  if (declared !== null && /^\d+$/.test(declared.trim())) {
+    if (Number(declared.trim()) > maxBytes) return bodyFail(tooLargeMessage(maxBytes), true)
+  }
+
+  const stream = req.body
+  if (!stream) return pass('')
+
+  const reader = stream.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (!value) continue
+      total += value.byteLength
+      if (total > maxBytes) {
+        // Stop pulling from the socket; do not wait for the rest of the upload.
+        await reader.cancel().catch(() => undefined)
+        return bodyFail(tooLargeMessage(maxBytes), true)
+      }
+      chunks.push(value)
+    }
+  } catch {
+    return bodyFail('Request body could not be read.')
+  }
+
+  const merged = new Uint8Array(total)
+  let offset = 0
+  for (const chunk of chunks) {
+    merged.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return pass(new TextDecoder().decode(merged))
+}
+
+/**
+ * Read AND parse a JSON request body with the byte cap enforced while reading.
+ * The drop-in replacement for `safeJson(await req.text(), max)`.
+ */
+export async function readJsonBody(
+  req: Request,
+  maxBytes: number
+): Promise<Valid<unknown> | BodyInvalid> {
+  const text = await readBodyText(req, maxBytes)
+  if (!text.ok) return text
+  const parsed = safeJson(text.value, maxBytes)
+  return parsed.ok ? parsed : bodyFail(parsed.error)
 }
 
 /** Narrow an unknown parse result to a plain object (not null, not an array). */

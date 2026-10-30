@@ -125,3 +125,37 @@ export async function resolveSubmissionCredential(
   if (!target) return null
   return resolveProviderCredential(userId, target)
 }
+
+/**
+ * Make a device listing BYOK-aware for one caller.
+ *
+ * The upstream listing is computed from the OPERATOR's environment, so on a
+ * deployment with no provider credentials every device comes back
+ * `available: false` — while the submit route would happily run a job on the
+ * caller's own stored credential. A device the operator cannot reach but whose
+ * vendor the caller has a readable credential for is therefore marked
+ * available, with `byok: true` so the UI can say whose account it will use.
+ *
+ * Devices that are already available are left exactly as they were: the
+ * operator's credential works and nothing about the caller changes that.
+ *
+ * @param devices The parsed upstream listing.
+ * @param ownProviders Providers the caller holds a readable credential for.
+ * @returns A new listing; the input is not mutated.
+ */
+export function withByokAvailability(
+  devices: unknown[],
+  ownProviders: ReadonlySet<ByokProvider>
+): unknown[] {
+  if (ownProviders.size === 0) return devices
+  return devices.map((entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return entry
+    const device = entry as Record<string, unknown>
+    if (device.available !== false || typeof device.id !== 'string') return entry
+    // Deliberately NOT passing `device.provider`: for Braket hardware it is the
+    // hardware vendor ('ionq', 'rigetti'), not the credential family.
+    const target = byokProviderFor(null, device.id)
+    if (!target || !ownProviders.has(target)) return entry
+    return { ...device, available: true, reason: null, byok: true }
+  })
+}

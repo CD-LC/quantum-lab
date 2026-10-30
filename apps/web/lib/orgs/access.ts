@@ -47,6 +47,7 @@ import { isSupabaseConfigured } from '@/lib/supabase'
 import { bearerToken, signInRequiredResponse, verifiedCallerId } from '@/lib/security/auth'
 import type { OrgContext } from '@/lib/orgs/store'
 import type { OrgMemberStatus, OrgRole } from '@/lib/orgs/types'
+import type { PlanId } from '@/lib/plans'
 
 const SUPABASE_URL = (process.env.NEXT_PUBLIC_SUPABASE_URL ?? '').trim()
 const SUPABASE_ANON_KEY = (process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? '').trim()
@@ -157,6 +158,84 @@ export function inviteLookupContext(): OrgContext | undefined {
   const service = getServiceSupabase()
   if (!service) return undefined
   return { userId: null, client: service }
+}
+
+/**
+ * Subscription statuses in good standing. The SAME set `orgs_insert_owner` in
+ * supabase/schema-hardening.sql and lib/billing/entitlements.ts honour, so the
+ * server route and the browser's RLS path agree on what "paid" means.
+ */
+const LICENCE_GOOD_STATUSES: readonly string[] = ['active', 'trialing', 'past_due']
+
+/**
+ * Does the verified caller hold a PERSONAL subscription to exactly `planId`?
+ *
+ * ── Why this exists (audit finding ORG-3, server half) ───────
+ * supabase/schema-hardening.sql closes "a Free account creates a University
+ * org for itself" with the `orgs_insert_owner` RLS policy — which only binds
+ * the anon-key path. POST /api/orgs writes through `orgContext()`, which
+ * prefers the SERVICE-ROLE client, so RLS never ran there and any signed-in
+ * caller could mint an org on a paid plan and take its owner seat. This is the
+ * same rule, enforced where the service role is in play.
+ *
+ * The subscription row is read directly rather than through getEntitlement():
+ * the entitlement is the STRONGER of the personal plan and any org seat, so a
+ * caller sitting on someone else's University org would look like an edu
+ * licence-holder, and a Team subscriber on an edu seat would look like they
+ * had no Team plan. A seat in someone else's org never licenses a new one.
+ *
+ * Fails closed: no context, no user, a query error or no row all answer false.
+ */
+export async function holdsPersonalLicence(
+  ctx: OrgContext | undefined,
+  planId: PlanId
+): Promise<boolean> {
+  if (!ctx || !ctx.userId) return false
+  try {
+    const { data, error } = await ctx.client
+      .from('subscriptions')
+      .select('plan_id, status')
+      .eq('user_id', ctx.userId)
+      .maybeSingle()
+    if (error || !data) return false
+    const row = data as Record<string, unknown>
+    return (
+      row.plan_id === planId &&
+      typeof row.status === 'string' &&
+      LICENCE_GOOD_STATUSES.includes(row.status)
+    )
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Does the verified caller already OWN an organisation on `planId`?
+ *
+ * One Team subscription licenses one 10-seat organisation. Without this check a
+ * single paid subscription could mint any number of organisations, each with
+ * its own seat allowance (audit finding ORG-3, the multiplication half).
+ *
+ * Fails OPEN on a query error: this is an abuse limiter, not an authorisation
+ * gate — the licence check beside it already failed closed — and refusing every
+ * creation during a database blip would punish the legitimate first org.
+ */
+export async function ownsOrgOnPlan(
+  ctx: OrgContext | undefined,
+  planId: PlanId
+): Promise<boolean> {
+  if (!ctx || !ctx.userId) return false
+  try {
+    const { data, error } = await ctx.client
+      .from('orgs')
+      .select('id')
+      .eq('owner_id', ctx.userId)
+      .eq('plan_id', planId)
+    if (error || !Array.isArray(data)) return false
+    return data.length > 0
+  } catch {
+    return false
+  }
 }
 
 function toRole(value: unknown): OrgRole | null {

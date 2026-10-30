@@ -28,11 +28,26 @@
  * Rate limited hard on both paths: each call is a live Stripe API request, and
  * Stripe rate-limits the account, not the caller. A user hammering this button
  * must not be able to make checkout start failing for everybody else.
+ *
+ * The two paths are limited DIFFERENTLY, and that is the point:
+ *
+ *  · Anyone without the operator secret is limited per IP, before the body is
+ *    parsed and before any Supabase round trip.
+ *  · An operator call is limited per TARGET ACCOUNT instead. The sweep in
+ *    docs/BILLING.md §8 runs one call per subscriber from one host with a
+ *    `sleep 1`; under the per-IP limit it was silently refused from the sixth
+ *    account onwards — `curl -sS` exits 0 on a 429 — so after a webhook
+ *    outage the runbook reported success and most subscribers stayed wrong.
+ *    Per account it still bounds the Stripe traffic one id can generate, and
+ *    the secret already gates who can present it at all.
  */
 
+/** Operator calls: per target account, generous enough for a retry loop. */
+const OPERATOR_PER_ACCOUNT_LIMIT = 20
+
 import { NextResponse } from 'next/server'
-import { timingSafeEqual } from 'node:crypto'
 import { reconcileEntitlement } from '@/lib/billing/reconcile'
+import { secretMatches } from '@/lib/billing/secretCompare'
 import { isStripeConfigured } from '@/lib/billing/stripe'
 import { isSupabaseConfigured } from '@/lib/supabase'
 import { verifiedCallerId } from '@/lib/security/auth'
@@ -48,13 +63,14 @@ const OPERATOR_SECRET = (process.env.BILLING_RECONCILE_SECRET ?? '').trim()
 /**
  * Constant-time compare. A `===` here leaks the secret one byte at a time to
  * anyone who can measure a few thousand requests, and this secret grants
- * "rewrite any account's plan from Stripe".
+ * "rewrite any account's plan from Stripe". Compared as SHA-256 digests (see
+ * lib/billing/secretCompare.ts) so a multi-byte character in the offered header
+ * can never make the compare throw.
  */
 function presentsOperatorSecret(req: Request): boolean {
   if (OPERATOR_SECRET.length === 0) return false
   const offered = (req.headers.get('x-reconcile-secret') ?? '').trim()
-  if (offered.length !== OPERATOR_SECRET.length) return false
-  return timingSafeEqual(Buffer.from(offered), Buffer.from(OPERATOR_SECRET))
+  return secretMatches(offered, OPERATOR_SECRET)
 }
 
 export async function POST(req: Request): Promise<Response> {
@@ -72,14 +88,21 @@ export async function POST(req: Request): Promise<Response> {
     })
   }
 
-  // Keyed on the IP and applied before the token is verified, so an
-  // unauthenticated flood costs no Supabase round trip. Tighter than the portal
-  // (10/min) because every allowed call reaches Stripe.
-  const limit = await rateLimit(callerKey(req.headers, 'billing-reconcile'), {
-    limit: 5,
-    windowMs: 60_000,
-  })
-  if (!limit.allowed) return apiError('rate_limited', { headers: retryAfterHeaders(limit) })
+  // Checked FIRST: a constant-time string compare, no I/O. It decides which
+  // limiter applies (see the header), and nothing below trusts it beyond that
+  // until the body has validated.
+  const operator = presentsOperatorSecret(req)
+
+  if (!operator) {
+    // Keyed on the IP and applied before the token is verified, so an
+    // unauthenticated flood costs no Supabase round trip. Tighter than the
+    // portal (10/min) because every allowed call reaches Stripe.
+    const limit = await rateLimit(callerKey(req.headers, 'billing-reconcile'), {
+      limit: 5,
+      windowMs: 60_000,
+    })
+    if (!limit.allowed) return apiError('rate_limited', { headers: retryAfterHeaders(limit) })
+  }
 
   const parsed = safeJson(await req.text(), 4_096)
   if (!parsed.ok) return badRequest(parsed.error)
@@ -88,7 +111,15 @@ export async function POST(req: Request): Promise<Response> {
   if (!checked.ok) return badRequest(checked.error)
   const userId = checked.value
 
-  if (!presentsOperatorSecret(req)) {
+  if (operator) {
+    // Per target account, not per IP: the sweep is many accounts from one
+    // host, and each account is what actually generates a Stripe call.
+    const limit = await rateLimit(callerKey(req.headers, 'billing-reconcile-op', userId), {
+      limit: OPERATOR_PER_ACCOUNT_LIMIT,
+      windowMs: 60_000,
+    })
+    if (!limit.allowed) return apiError('rate_limited', { headers: retryAfterHeaders(limit) })
+  } else {
     const caller = await verifiedCallerId(req)
     if (caller === null) {
       return apiError('unauthorized', { message: 'Sign in to refresh your subscription.' })

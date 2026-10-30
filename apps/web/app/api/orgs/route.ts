@@ -15,10 +15,10 @@ import { NextResponse } from 'next/server'
 import { createOrg, listOrgs, planCanOwnSeats } from '@/lib/orgs/store'
 import { PLAN_BY_ID, type PlanId } from '@/lib/plans'
 import { isSupabaseConfigured } from '@/lib/supabase'
-import { SIGN_IN_REQUIRED, verifiedCallerId } from '@/lib/security/auth'
-import { orgContext } from '@/lib/orgs/access'
+import { SIGN_IN_REQUIRED, verifiedCaller, verifiedCallerId } from '@/lib/security/auth'
+import { holdsPersonalLicence, orgContext, ownsOrgOnPlan } from '@/lib/orgs/access'
 import { check, clientKey, retryHeaders } from '@/lib/security/ratelimit'
-import { email as validEmail, safeJson, str, uuid } from '@/lib/security/validate'
+import { email as validEmail, readJsonBody, str, uuid } from '@/lib/security/validate'
 import { apiError, errorForStatus } from '@/lib/apiError'
 import { reportError } from '@/lib/observability/report'
 
@@ -103,7 +103,8 @@ export async function POST(req: Request): Promise<Response> {
   }
 
   // SECURITY FIX (audit finding VAL-1): byte-capped parse instead of req.json().
-  const parsed = safeJson(await req.text(), 8_192)
+  const parsed = await readJsonBody(req, 8_192)
+  if (!parsed.ok && parsed.tooLarge) return apiError('payload_too_large')
   if (!parsed.ok) return bad(parsed.error, 400)
   const body: unknown = parsed.value
 
@@ -122,7 +123,7 @@ export async function POST(req: Request): Promise<Response> {
 
   const ownerEmailResult = validEmail(body.ownerEmail, 'ownerEmail')
   if (!ownerEmailResult.ok) return bad(ownerEmailResult.error, 400)
-  const ownerEmail = ownerEmailResult.value
+  let ownerEmail = ownerEmailResult.value
 
   const planIdRaw = body.planId
 
@@ -131,14 +132,30 @@ export async function POST(req: Request): Promise<Response> {
   // this handler has nowhere to write, so the zero-config demo path is intact.
   let callerId: string | null = null
   if (isSupabaseConfigured) {
-    callerId = await verifiedCallerId(req)
-    if (callerId === null) {
+    const caller = await verifiedCaller(req)
+    if (!caller) {
       return bad(
         'Sign-in required. Send your Supabase access token as `Authorization: Bearer <token>`.',
         401
       )
     }
+    callerId = caller.id
     if (callerId !== ownerId) return bad('ownerId must be your own user id.', 403)
+
+    // SECURITY FIX: the owner's seat row carries the VERIFIED email, never one
+    // from the body. addMember de-duplicates by email and invite acceptance
+    // matches the held seat by email, so a planted address here would make a
+    // later invite to that person silently resolve to the owner's row. A
+    // mismatching body value is refused rather than quietly replaced, so a
+    // client that sends the wrong address finds out. An account with no email
+    // (phone sign-in) keeps the validated body value — there is nothing to
+    // compare it against.
+    if (caller.email) {
+      if (ownerEmail !== caller.email) {
+        return bad('ownerEmail must be the email address of your own account.', 403)
+      }
+      ownerEmail = caller.email
+    }
   }
 
   if (typeof planIdRaw !== 'string' || !(PLAN_IDS as string[]).includes(planIdRaw)) {
@@ -154,13 +171,40 @@ export async function POST(req: Request): Promise<Response> {
     )
   }
 
+  const ctx = orgContext(req, callerId)
+
+  // SECURITY FIX (audit finding ORG-3, server half): an organisation on a paid
+  // plan needs the caller's OWN active subscription to that plan. The RLS
+  // policy `orgs_insert_owner` enforces exactly this for the browser, but this
+  // route writes through the service-role client, which RLS does not see — so
+  // without this check any Free sign-up could POST itself a University org and
+  // be handed the plan by lib/billing/entitlements.ts. A seat in someone else's
+  // org does not count (see holdsPersonalLicence). Fails closed when there is
+  // no client to ask. Seat count is never taken from the body: createOrg
+  // derives it from PLAN_BY_ID.
+  if (isSupabaseConfigured && !(await holdsPersonalLicence(ctx, planId))) {
+    return bad(
+      `Creating a ${PLAN_BY_ID[planId].name} organisation needs an active ` +
+        `${PLAN_BY_ID[planId].name} subscription on your own account. ` +
+        'Subscribe first, or contact support for an invoiced licence.',
+      403
+    )
+  }
+
+  // One subscription, one organisation: a second org on the same plan would
+  // carry a second seat allowance on a single payment.
+  if (isSupabaseConfigured && (await ownsOrgOnPlan(ctx, planId))) {
+    return bad(
+      `You already own a ${PLAN_BY_ID[planId].name} organisation. One subscription licenses ` +
+        'one organisation; add seats to it, or contact support for another licence.',
+      409
+    )
+  }
+
   try {
     // SECURITY FIX (audit finding ORG-2): with a context the store writes as
     // the verified caller; without one (zero-config) it behaves as before.
-    const org = await createOrg(
-      { name, planId, ownerId, ownerEmail },
-      orgContext(req, callerId)
-    )
+    const org = await createOrg({ name, planId, ownerId, ownerEmail }, ctx)
     return NextResponse.json({ org }, { status: 201 })
   } catch (err) {
     console.error('[api/orgs POST]', err)

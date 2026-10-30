@@ -82,6 +82,22 @@ export async function POST(req: Request): Promise<Response> {
   const caller = await requireCaller(req, 'hardware:read')
   if (!caller.ok) return caller.response
 
+  // Publishing is irreversible and world-readable (published_runs rows are
+  // immutable and served to anonymous visitors), so a read-scoped API key —
+  // the credential that sits in CI variables and notebooks — must not be able
+  // to do it. A person signed in with a session token can; the `optIn` check
+  // below is then that person's explicit consent, not a script's.
+  if (caller.via !== 'session') {
+    return NextResponse.json(
+      {
+        detail:
+          'Publishing a run makes it public and cannot be undone, so it needs a signed-in ' +
+          'session rather than an API key. Publish it from the Qubit16 site while signed in.',
+      },
+      { status: 403 }
+    )
+  }
+
   const body = await readJsonObject(req)
   if (!body.ok) return body.response
 

@@ -264,7 +264,8 @@ describe('validation at the edge', () => {
         shots: 10,
       })
     )
-    expect(response.status).toBe(400)
+    // The body itself is over the byte cap, so it is refused while being read.
+    expect(response.status).toBe(413)
     expect(upstream).not.toHaveBeenCalled()
   })
 

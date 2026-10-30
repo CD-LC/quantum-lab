@@ -17,7 +17,7 @@ import { normalizeEvent, type AnalyticsEvent } from '@/lib/analytics/events'
 import { isSupabaseConfigured } from '@/lib/supabase'
 import { getServiceSupabase } from '@/lib/billing/entitlements'
 import { check, clientKey, retryHeaders } from '@/lib/security/ratelimit'
-import { isRecord, safeJson } from '@/lib/security/validate'
+import { isRecord, readJsonBody } from '@/lib/security/validate'
 
 // Required: this handler reads the request body and must never be prerendered
 // or cached. Prerendering a dynamic handler has broken `next build` here before.
@@ -106,11 +106,16 @@ export async function POST(request: Request): Promise<NextResponse> {
     )
   }
 
-  const parsed = safeJson(await request.text(), MAX_BODY_BYTES)
+  // The cap is enforced while the body is read, not after it is buffered.
+  const parsed = await readJsonBody(request, MAX_BODY_BYTES)
   if (!parsed.ok) {
     return NextResponse.json(
-      { stored: false, error: parsed.error, code: 'bad_request' },
-      { status: 400 }
+      {
+        stored: false,
+        error: parsed.error,
+        code: parsed.tooLarge ? 'payload_too_large' : 'bad_request',
+      },
+      { status: parsed.tooLarge ? 413 : 400 }
     )
   }
   const body: unknown = parsed.value

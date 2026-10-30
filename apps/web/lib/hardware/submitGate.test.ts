@@ -533,6 +533,24 @@ describe('POST /api/hardware/submit — the happy path and the secret', () => {
     expect(usageRows('pro-user')).toHaveLength(0)
   })
 
+  it('keeps the usage row when the upstream times out, because the job may be enqueued', async () => {
+    const pro = signIn('pro-user', 'pro')
+    vi.stubGlobal(
+      'fetch',
+      (upstream = vi.fn(async () => {
+        throw new DOMException('aborted', 'AbortError')
+      }))
+    )
+
+    const response = await submitPOST(submitRequest(pro))
+
+    expect(response.status).toBe(504)
+    const body = (await response.json()) as { unknownOutcome?: boolean }
+    expect(body.unknownOutcome).toBe(true)
+    // Not refunded: a free vendor job would otherwise be one timeout away.
+    expect(usageRows('pro-user')).toHaveLength(1)
+  })
+
   it('still refuses a malformed body from a paying caller, before any billing', async () => {
     const pro = signIn('pro-user', 'pro')
 

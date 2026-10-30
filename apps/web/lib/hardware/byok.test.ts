@@ -80,3 +80,41 @@ describe('byokProviderFor', () => {
     expect(byokProviderFor(null, 'simulator_ionq')).toBeNull()
   })
 })
+
+describe('withByokAvailability', () => {
+  const device = (id: string, over: Record<string, unknown> = {}) => ({
+    id,
+    provider: id.startsWith('ibm') ? 'ibm' : 'ionq',
+    available: false,
+    reason: 'IBM hardware needs an IBM Quantum API token',
+    ...over,
+  })
+
+  it('marks a device available when the caller holds a credential for its vendor', async () => {
+    const { withByokAvailability } = await import('@/lib/hardware/byok')
+    const out = withByokAvailability(
+      [device('ibm_brisbane'), device('ionq_aria'), device('azure_ionq_aria', { provider: 'azure' })],
+      new Set(['ibm'] as const)
+    ) as Array<Record<string, unknown>>
+    expect(out[0]).toMatchObject({ available: true, reason: null, byok: true })
+    expect(out[1]).toMatchObject({ available: false })
+    expect(out[1]).not.toHaveProperty('byok')
+    expect(out[2]).toMatchObject({ available: false })
+  })
+
+  it('maps Braket hardware by device id, not by hardware vendor', async () => {
+    const { withByokAvailability } = await import('@/lib/hardware/byok')
+    const out = withByokAvailability([device('ionq_aria'), device('rigetti_ankaa')], new Set(['braket'] as const)) as Array<
+      Record<string, unknown>
+    >
+    expect(out.every((d) => d.available === true && d.byok === true)).toBe(true)
+  })
+
+  it('leaves operator-available devices and an empty credential set untouched', async () => {
+    const { withByokAvailability } = await import('@/lib/hardware/byok')
+    const ok = device('ibm_brisbane', { available: true, reason: null })
+    expect(withByokAvailability([ok], new Set(['ibm'] as const))[0]).toBe(ok)
+    const list = [device('ibm_brisbane')]
+    expect(withByokAvailability(list, new Set())).toBe(list)
+  })
+})

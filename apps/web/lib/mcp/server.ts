@@ -46,15 +46,19 @@
  */
 
 import {
+  execute,
   fromQasm,
+  hasClassicalControl,
+  mulberry32,
   run,
-  simulateSteps,
+  simulate,
   toQasm,
   GATE_LIBRARY,
   type Circuit,
   type Complex,
   type StateVector,
 } from '@/lib/quantum'
+import { reportError } from '@/lib/observability/report'
 import { CHALLENGES, getChallenge } from '@/lib/challenges/catalogue'
 import {
   GENERATED_KINDS,
@@ -107,6 +111,24 @@ export const MCP_DEFAULT_SHOTS = 1024
 export const MCP_MAX_QASM_CHARS = 20_000
 
 /**
+ * Gate-count ceiling for any circuit a tool simulates. The QASM size cap alone
+ * admits ~2,200 one-line gates, and every gate on a 16-qubit register is a
+ * 65,536-amplitude sweep — a free CPU primitive against a 0.25-vCPU container,
+ * and (before get_statevector_at_step kept a single vector) a 1 MB allocation
+ * per gate. 1,000 gates is an order of magnitude past any teaching circuit and
+ * keeps the worst case at well under a second of CPU and one statevector.
+ */
+export const MCP_MAX_OPS = 1_000
+
+/**
+ * Rate-limit namespace for the daily model-call quota generate_verified_circuit
+ * charges. Shared with app/api/workbench/generate/route.ts ON PURPOSE: it is the
+ * same loop spending the same budget, so the MCP tool and the web page draw
+ * from one per-caller allowance instead of doubling it.
+ */
+const GENERATE_QUOTA_PREFIX = 'workbench-day'
+
+/**
  * Statevector entries below this magnitude are omitted from tool output.
  * A 16-qubit state has 65 536 amplitudes and almost all of them are exactly
  * zero in every teaching circuit; serialising them would bloat a reply to
@@ -144,14 +166,51 @@ export type JsonSchema = Record<string, unknown>
  * Per-request context the route hands to `callTool`. Almost every tool ignores
  * it; `submit_hardware_job` reads the caller's `Authorization` header from it
  * (identity must come from a header the transport carried, never from a tool
- * argument an agent could fabricate) and the forwarding headers so the
- * hardware route's IP rate limit keys on the real caller, not on this server.
+ * argument an agent could fabricate) and `generate_verified_circuit` uses both
+ * fields to resolve the caller's tier and charge their daily model quota.
+ *
+ * `clientIp` is the ONE address the transport trusted — what its own rate
+ * limiter keyed on (`clientAddressFrom`), never a header copied verbatim. A
+ * raw `x-forwarded-for` has a client-chosen first hop (Cloudflare only appends
+ * to it), so forwarding that downstream let a caller pick the hardware route's
+ * rate-limit bucket per request.
  */
 export interface ToolCallContext {
   /** Verbatim `Authorization` header of the MCP request, or null. */
   authorization?: string | null
-  /** Verbatim `x-forwarded-for` header, for downstream rate-limit keying. */
+  /** The transport-trusted client address, for downstream rate-limit keying. */
+  clientIp?: string | null
+  /**
+   * Same value as `clientIp`, kept under its historical name for consumers in
+   * lib/workbench that forward it as `x-forwarded-for`. Set it to the trusted
+   * address, never to the raw header.
+   */
   forwardedFor?: string | null
+}
+
+/**
+ * The client address a transport should put in `ToolCallContext`, resolved
+ * with the SAME precedence lib/rateLimit's `callerKey` uses — Cloudflare's
+ * `cf-connecting-ip` (edge-written, not rotatable), else the first hop of
+ * `x-forwarded-for`, else `x-real-ip` — so the bucket a downstream route
+ * derives from it is the bucket this transport already limited. Bounded to 64
+ * chars like callerKey; null when no address is present.
+ */
+export function clientAddressFrom(headers: Headers): string | null {
+  const cf = headers.get('cf-connecting-ip')?.trim() ?? ''
+  const firstHop = (headers.get('x-forwarded-for') ?? '').split(',')[0]?.trim() ?? ''
+  const real = headers.get('x-real-ip')?.trim() ?? ''
+  const address = (cf || firstHop || real).slice(0, 64)
+  return address || null
+}
+
+/** Headers that make a downstream route's `callerKey` resolve to `address`. */
+function trustedAddressHeaders(ctx: ToolCallContext): Record<string, string> {
+  const address = (ctx.clientIp ?? ctx.forwardedFor ?? '').trim().slice(0, 64)
+  if (!address) return {}
+  // Both headers, one value: callerKey prefers cf-connecting-ip, and a
+  // single-hop x-forwarded-for has no client-chosen first hop left to trust.
+  return { 'cf-connecting-ip': address, 'x-forwarded-for': address }
 }
 
 export interface McpToolDef {
@@ -198,6 +257,14 @@ function circuitFromArgs(args: Record<string, unknown>): { circuit: Circuit } | 
       error: err(
         `This circuit uses ${circuit.numQubits} qubits; the simulator's ceiling is ` +
           `${MCP_MAX_QUBITS}. Reduce the register (qubit[${MCP_MAX_QUBITS}] q; at most).`,
+      ),
+    }
+  }
+  if (circuit.ops.length > MCP_MAX_OPS) {
+    return {
+      error: err(
+        `This circuit has ${circuit.ops.length} gates; the ceiling is ${MCP_MAX_OPS}. ` +
+          'Split it into shorter circuits or drop the repeated section.',
       ),
     }
   }
@@ -248,6 +315,42 @@ function sparseAmplitudes(sv: StateVector): { entries: AmplitudeEntry[]; omitted
     entries.push({ state: sv.label(i), re: a.re, im: a.im, probability })
   }
   return { entries, omitted }
+}
+
+/**
+ * A seed derived from the whole circuit, so every step of one circuit replays
+ * the same measurement outcomes: `execute` draws from the rng in op order, so
+ * running a prefix with the same seed reproduces exactly the frame the full
+ * run would have passed through. FNV-1a over the ops; mirrors the private
+ * `circuitSeed` in lib/quantum.ts in purpose, not necessarily in value.
+ */
+function stepSeed(circuit: Circuit): number {
+  let h = 0x811c9dc5
+  const push = (n: number) => {
+    h ^= n | 0
+    h = Math.imul(h, 0x01000193)
+  }
+  push(circuit.numQubits)
+  const text = JSON.stringify([circuit.initialStates ?? null, circuit.ops])
+  for (let i = 0; i < text.length; i++) push(text.charCodeAt(i))
+  return h >>> 0
+}
+
+/**
+ * The state after the first `step` ops, computed with ONE statevector.
+ *
+ * `simulateSteps` clones the vector after every gate and returns all frames —
+ * right for the UI's scrubber, wrong here: at 16 qubits each clone is 1 MB,
+ * so a 2,000-gate circuit (well inside the QASM size cap) held 2 GB of
+ * Float64Arrays at once and could OOM the single web replica from one
+ * unauthenticated request. Simulating the prefix keeps exactly one vector.
+ */
+function stateAfterStep(circuit: Circuit, step: number): StateVector {
+  const prefix: Circuit = { ...circuit, ops: circuit.ops.slice(0, step) }
+  if (hasClassicalControl(circuit)) {
+    return execute(prefix, { rng: mulberry32(stepSeed(circuit)) }).state.normalize()
+  }
+  return simulate(prefix)
 }
 
 // ────────────────────────────────────────────────────────────
@@ -349,14 +452,13 @@ const getStatevectorAtStep: McpToolDef = {
       return err(`${step.error} This circuit has ${totalSteps} step(s), so valid steps are 0–${totalSteps}.`)
     }
 
-    let frames: StateVector[]
+    let frame: StateVector
     try {
-      frames = simulateSteps(parsed.circuit)
+      frame = stateAfterStep(parsed.circuit, step.value)
     } catch (cause) {
       return err(`Simulation failed: ${cause instanceof Error ? cause.message : String(cause)}`)
     }
 
-    const frame = frames[step.value].normalize()
     const { entries, omitted } = sparseAmplitudes(frame)
     const appliedOp = step.value === 0 ? null : parsed.circuit.ops[step.value - 1]
 
@@ -886,11 +988,14 @@ const submitHardwareJob: McpToolDef = {
     // import is dynamic so the unauthenticated refusal above never loads the
     // billing stack at all.
     const { POST } = await import('@/app/api/hardware/submit/route')
+    // The hardware route's IP limiter must land in the bucket the MCP route
+    // already limited, so it gets the transport-trusted address under both
+    // header names — never the request's raw x-forwarded-for.
     const headers: Record<string, string> = {
       'content-type': 'application/json',
       authorization,
+      ...trustedAddressHeaders(ctx),
     }
-    if (ctx.forwardedFor) headers['x-forwarded-for'] = ctx.forwardedFor
     const body: Record<string, unknown> = {
       qasm,
       backend: backend.value,
@@ -935,16 +1040,44 @@ const submitHardwareJob: McpToolDef = {
 // ────────────────────────────────────────────────────────────
 
 /**
+ * Wrap a live adapter so a provider failure reaches the caller as a fixed
+ * sentence. The loop in lib/workbench/generate.ts copies a rejection's message
+ * into the structured result (`error`, `attempts[].parseError`); for an
+ * AI SDK call error that message is the provider's response text — deployment
+ * and model names, quota wording, hostnames. The real error goes to
+ * observability instead.
+ */
+export function scrubProviderErrors(adapter: ProviderAdapter): ProviderAdapter {
+  return {
+    label: adapter.label,
+    complete: async (request, signal) => {
+      try {
+        return await adapter.complete(request, signal)
+      } catch (cause) {
+        reportError(cause, { route: 'mcp', tool: 'generate_verified_circuit', stage: 'complete' })
+        throw new Error('The model provider returned an error; try again later.')
+      }
+    },
+  }
+}
+
+/**
  * The generate → verify → repair loop from lib/workbench/generate.ts. The
  * loop itself is pure; the model behind it is resolved HERE, at call time,
- * through the same admin-configured provider policy the tutor uses, for the
- * signed-out tier — this surface is anonymous, so it gets what the admin
- * allows anonymous callers. When that tier has no live model the tool still
- * verifies a supplied candidate and says plainly that no model was called.
+ * exactly as app/api/workbench/generate/route.ts resolves it: the caller's
+ * verified identity (from the transport's Authorization header) → entitlement
+ * → tier → the admin-configured policy for that tier → ONE unit of that
+ * tier's daily model quota, charged before any model is built. Anonymous
+ * callers therefore get what the admin allows anonymous callers, including
+ * the same `messagesPerDay` cap the tutor applies — before this gate an
+ * anonymous MCP client could run up to MAX_ATTEMPTS_CEILING paid completions
+ * per call at the transport's 1,000/hour, with no daily bound at all. When
+ * the caller gets no model the tool still verifies a supplied candidate and
+ * says plainly that no model was called.
  *
- * The provider module is imported dynamically so that the registry (and its
- * tests) load without the AI SDK, and so the candidate-only path never
- * touches provider configuration at all.
+ * The access and provider modules are imported dynamically so that the
+ * registry (and its tests) load without the AI SDK or Supabase, and so the
+ * candidate-only path never touches identity, quota or provider configuration.
  */
 const generateVerifiedCircuitTool: McpToolDef = {
   name: 'generate_verified_circuit',
@@ -961,28 +1094,33 @@ const generateVerifiedCircuitTool: McpToolDef = {
     'A pass means the circuit matches YOUR spec on an ideal simulator — not that the spec is what ' +
     'you meant, and nothing about hardware.',
   inputSchema: GENERATE_TOOL_INPUT_SCHEMA as unknown as JsonSchema,
-  handler: async (args) => {
+  handler: async (args, ctx) => {
     const parsed = parseGenerateArgs(args)
     if (!parsed.ok) return err(parsed.error)
     const { spec, maxAttempts, candidate } = parsed.input
 
     // Only look for a model if one could be needed: no candidate, or more
-    // rounds than the candidate alone accounts for.
+    // rounds than the candidate alone accounts for. Asking charges the quota.
     let provider: ProviderAdapter | null = null
     let providerNote: string | null = null
     if (!candidate || maxAttempts > 1) {
       try {
-        const { liveProviderForTier } = await import('@/lib/workbench/liveProvider')
-        const lookup = await liveProviderForTier('anonymous')
-        provider = lookup.adapter
-        if (!provider) {
-          providerNote =
-            lookup.resolution.kind === 'off'
-              ? 'No model: the anonymous tier is switched off for live models.'
-              : 'No model is configured for anonymous callers; only the candidate (if any) was verified.'
+        const { liveModelForCaller } = await import('@/lib/llm/callerAccess')
+        const access = await liveModelForCaller(
+          { authorization: ctx.authorization ?? null, clientIp: ctx.clientIp ?? ctx.forwardedFor ?? null },
+          GENERATE_QUOTA_PREFIX,
+        )
+        if (access.kind === 'live') {
+          const { adapterFor } = await import('@/lib/workbench/liveProvider')
+          provider = scrubProviderErrors(adapterFor(access.resolution))
+        } else {
+          providerNote = access.note
         }
       } catch (cause) {
-        providerNote = `No model: provider setup failed (${cause instanceof Error ? cause.message : String(cause)}).`
+        // The cause can name a provider host, deployment or key problem; that
+        // belongs in observability, not in an anonymous caller's reply.
+        reportError(cause, { route: 'mcp', tool: 'generate_verified_circuit', stage: 'provider' })
+        providerNote = 'No model: provider setup failed; only the candidate (if any) was verified.'
       }
     }
 
@@ -1001,6 +1139,36 @@ const generateVerifiedCircuitTool: McpToolDef = {
 // Registry
 // ────────────────────────────────────────────────────────────
 
+/**
+ * Refuse a tool call whose `qasm` argument holds more than MCP_MAX_OPS gates,
+ * before the wrapped handler simulates it. Text over the size cap or that does
+ * not parse is left for the handler to reject with its own, more specific
+ * message.
+ */
+export function withOpCeiling(tool: McpToolDef): McpToolDef {
+  return {
+    ...tool,
+    handler: (args, ctx) => {
+      const qasm = args.qasm
+      if (typeof qasm === 'string' && qasm.length <= MCP_MAX_QASM_CHARS) {
+        let ops = 0
+        try {
+          ops = fromQasm(qasm).ops.length
+        } catch {
+          ops = 0
+        }
+        if (ops > MCP_MAX_OPS) {
+          return err(
+            `This circuit has ${ops} gates; the ceiling is ${MCP_MAX_OPS}. ` +
+              'Split it into shorter circuits or drop the repeated section.',
+          )
+        }
+      }
+      return tool.handler(args, ctx)
+    },
+  }
+}
+
 export const MCP_TOOLS: McpToolDef[] = [
   runCircuit,
   getStatevectorAtStep,
@@ -1014,8 +1182,10 @@ export const MCP_TOOLS: McpToolDef[] = [
   getLessonTool,
   getGateReference,
   generateVerifiedCircuitTool,
-  // Workbench: experiment records (lib/workbench/experimentTools.ts).
-  ...EXPERIMENT_TOOLS,
+  // Workbench: experiment records (lib/workbench/experimentTools.ts). run_step
+  // simulates the caller's QASM through lib/workbench/targets.ts, which has no
+  // gate-count bound of its own, so it gets the same ceiling here.
+  ...EXPERIMENT_TOOLS.map((tool) => (tool.name === 'run_step' ? withOpCeiling(tool) : tool)),
 ]
 
 const TOOL_BY_NAME: ReadonlyMap<string, McpToolDef> = new Map(
@@ -1062,10 +1232,20 @@ export async function callToolAsync(
   try {
     return await tool.handler(record, ctx)
   } catch (cause) {
-    return err(
-      `Tool "${name}" failed: ${cause instanceof Error ? cause.message : String(cause)}`,
-    )
+    return toolFailure(name, cause)
   }
+}
+
+/**
+ * An unexpected throw from a handler, as a tool result. The exception text is
+ * reported to observability and NOT echoed: on this anonymous surface a raw
+ * message can carry provider, hostname, table or constraint detail (the same
+ * reasoning app/api/agent/route.ts records for provider bodies). Tools that
+ * have something actionable to say return `err(...)` themselves.
+ */
+function toolFailure(name: string, cause: unknown): ToolResult {
+  reportError(cause, { route: 'mcp', tool: name, stage: 'handler' })
+  return err(`Tool "${name}" failed; try again later.`)
 }
 
 /**
@@ -1099,8 +1279,6 @@ export function callTool(name: string, args: unknown, ctx: ToolCallContext = {})
     }
     return result
   } catch (cause) {
-    return err(
-      `Tool "${name}" failed: ${cause instanceof Error ? cause.message : String(cause)}`,
-    )
+    return toolFailure(name, cause)
   }
 }

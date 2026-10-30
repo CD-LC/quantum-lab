@@ -54,6 +54,7 @@ import {
   type GateName,
   type GateOp,
 } from '@/lib/quantum'
+import { reportError } from '@/lib/observability/report'
 
 // ────────────────────────────────────────────────────────────
 // Target shapes
@@ -200,6 +201,12 @@ export type StepResult =
       gateCount: number
       /** Ideal simulator only: the final statevector, near-zero entries dropped. */
       statevector?: AmplitudeEntry[]
+      /**
+       * Ideal simulator only: how many non-negligible amplitudes were left out
+       * of `statevector` because it is capped at MAX_PERSISTED_AMPLITUDES (the
+       * largest by probability are the ones kept). Absent when nothing was cut.
+       */
+      statevectorOmitted?: number
       /** Noisy simulator only: how many shots suffered at least one gate error. */
       erroredShots?: number
     }
@@ -215,6 +222,26 @@ export type StepResult =
     }
 
 const AMPLITUDE_FLOOR = 1e-10
+
+/**
+ * The most amplitudes a step keeps. A step is persisted (jsonb) and returned in
+ * full to whoever reads the record; a 16-qubit uniform state has 65,536 of
+ * them, ~6.5 MB of JSON from a 400-byte request. The record is a lab notebook,
+ * not a state dump: the 256 largest amplitudes carry every circuit a person
+ * reads by eye, and `counts` carries the rest. run_circuit /
+ * get_statevector_at_step are the tools for a full state.
+ */
+export const MAX_PERSISTED_AMPLITUDES = 256
+
+/**
+ * Ceiling on the noisy simulator's worst-case work, in (shots x gates x
+ * amplitudes). With the default error rates nearly every shot of a long
+ * circuit re-runs the whole circuit, so cost is shots x gates x 2^qubits
+ * sweeps: measured at ~2.7 ns each, 4e9 of them held the event loop for 11 s.
+ * 4e8 is about a second, which no teaching circuit approaches (10 qubits, 100
+ * gates, 4096 shots is exactly that).
+ */
+export const MAX_NOISY_WORK = 4e8
 
 // ────────────────────────────────────────────────────────────
 // Noisy simulation
@@ -469,15 +496,46 @@ export async function runOnTarget(
     }
   }
 
+  if (target.kind === 'noisy-simulator') {
+    const work = shots * circuit.ops.length * 2 ** circuit.numQubits
+    if (work > MAX_NOISY_WORK) {
+      const affordable = Math.max(1, Math.floor(MAX_NOISY_WORK / (circuit.ops.length * 2 ** circuit.numQubits)))
+      return {
+        ok: false,
+        error:
+          `This noisy run is too large (${shots} shots x ${circuit.ops.length} gates on ${circuit.numQubits} qubits). ` +
+          (affordable < shots
+            ? `Use at most ${affordable} shots for this circuit, or a shorter or narrower circuit.`
+            : 'Use a shorter or narrower circuit.'),
+      }
+    }
+  }
+
   try {
     if (target.kind === 'simulator') {
       const out = run(circuit, shots, 0, seed)
-      const statevector: AmplitudeEntry[] = []
+      let statevector: AmplitudeEntry[] = []
+      const kept: { index: number; probability: number }[] = []
       for (let i = 0; i < out.statevector.length; i++) {
         const probability = out.probabilities[i]
         if (Math.sqrt(probability) < AMPLITUDE_FLOOR) continue
-        statevector.push({ state: out.labels[i], re: out.statevector[i].re, im: out.statevector[i].im, probability })
+        kept.push({ index: i, probability })
       }
+      const omitted = Math.max(0, kept.length - MAX_PERSISTED_AMPLITUDES)
+      // Keep the largest by probability (ties by basis index), shown in basis order.
+      const chosen =
+        omitted > 0
+          ? kept
+              .sort((a, b) => b.probability - a.probability || a.index - b.index)
+              .slice(0, MAX_PERSISTED_AMPLITUDES)
+              .sort((a, b) => a.index - b.index)
+          : kept
+      statevector = chosen.map(({ index, probability }) => ({
+        state: out.labels[index],
+        re: out.statevector[index].re,
+        im: out.statevector[index].im,
+        probability,
+      }))
       return {
         ok: true,
         result: {
@@ -487,6 +545,7 @@ export async function runOnTarget(
           numQubits: circuit.numQubits,
           gateCount: circuit.ops.length,
           statevector,
+          ...(omitted > 0 ? { statevectorOmitted: omitted } : {}),
         },
       }
     }
@@ -503,6 +562,8 @@ export async function runOnTarget(
       },
     }
   } catch (cause) {
-    return { ok: false, error: `Simulation failed: ${cause instanceof Error ? cause.message : String(cause)}` }
+    // An engine exception's text is internal; it goes to observability.
+    reportError(cause, { module: 'workbench/targets', stage: 'simulate', target: target.kind })
+    return { ok: false, error: 'Simulation failed on the server; check the circuit and try again.' }
   }
 }

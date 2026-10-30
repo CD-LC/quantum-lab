@@ -32,7 +32,7 @@ import {
   requireOrgRole,
 } from '@/lib/orgs/access'
 import { check, clientKey, retryHeaders } from '@/lib/security/ratelimit'
-import { email as validEmail, safeJson, str } from '@/lib/security/validate'
+import { email as validEmail, readJsonBody, str } from '@/lib/security/validate'
 import { apiError, errorForStatus } from '@/lib/apiError'
 import { reportError } from '@/lib/observability/report'
 
@@ -167,7 +167,8 @@ export async function POST(req: Request): Promise<Response> {
   if (isDenied(auth)) return auth.denied
 
   // SECURITY FIX (audit finding VAL-1): byte-capped parse instead of req.json().
-  const parsed = safeJson(await req.text(), 8_192)
+  const parsed = await readJsonBody(req, 8_192)
+  if (!parsed.ok && parsed.tooLarge) return apiError('payload_too_large')
   if (!parsed.ok) return bad(parsed.error, 400)
   const body: unknown = parsed.value
   if (!isRecord(body)) return bad('Expected a JSON object.', 400)
@@ -248,7 +249,8 @@ export async function PATCH(req: Request): Promise<Response> {
   if (isDenied(auth)) return auth.denied
 
   // SECURITY FIX (audit finding VAL-1): byte-capped parse instead of req.json().
-  const parsed = safeJson(await req.text(), 8_192)
+  const parsed = await readJsonBody(req, 8_192)
+  if (!parsed.ok && parsed.tooLarge) return apiError('payload_too_large')
   if (!parsed.ok) return bad(parsed.error, 400)
   const body: unknown = parsed.value
   if (!isRecord(body)) return bad('Expected a JSON object.', 400)

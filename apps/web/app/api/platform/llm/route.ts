@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
-import { badRequest } from '@/lib/apiError'
-import { isRecord, safeJson } from '@/lib/security/validate'
+import { badRequest, apiError } from '@/lib/apiError'
+import { isRecord, readJsonBody } from '@/lib/security/validate'
 import { guardPlatformAdmin } from '@/lib/platform/routeGuard'
 import {
   effectiveLlmSettings,
@@ -57,7 +57,8 @@ export async function GET(req: Request): Promise<Response> {
 export async function PUT(req: Request): Promise<Response> {
   const guard = await guardPlatformAdmin(req, 'platform-llm-write', 20)
   if (!guard.ok) return guard.response
-  const parsed = safeJson(await req.text(), MAX_BODY_BYTES)
+  const parsed = await readJsonBody(req, MAX_BODY_BYTES)
+  if (!parsed.ok && parsed.tooLarge) return apiError('payload_too_large')
   if (!parsed.ok) return badRequest(parsed.error)
   if (!isRecord(parsed.value) || !isRecord(parsed.value.patch)) {
     return badRequest('Body must be { patch: {...}, version?: number }.')

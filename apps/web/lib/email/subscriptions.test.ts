@@ -17,6 +17,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
+import { dueCourseDay } from '@/lib/email/courseSchedule'
 import {
   __resetSubscriptionStoreForTests,
   beginSubscription,
@@ -145,6 +146,23 @@ describe('unsubscribe — the promise that must actually persist', () => {
     expect(afterSignup?.unsubscribedAt).toBeNull()
 
     expect(await confirmSubscriptionByToken(fresh)).toBe('confirmed')
+  })
+
+  it('re-signup resets the send record, so the course restarts at day 1', async () => {
+    const token = await signup()
+    await confirmSubscriptionByToken(token)
+    const store = getSubscriptionStore()
+    const before = await store.getByEmail(EMAIL, 'course-7day')
+    await store.upsert({ ...before!, sentDays: [1, 2, 3, 4, 7] })
+    await unsubscribeByToken(token)
+
+    const fresh = await signup()
+    expect(await confirmSubscriptionByToken(fresh)).toBe('confirmed')
+
+    const row = await store.getByEmail(EMAIL, 'course-7day')
+    expect(row?.sentDays).toEqual([])
+    const later = new Date(new Date(row!.confirmedAt!).getTime() + 60_000)
+    expect(dueCourseDay(row!, later)).toBe(1)
   })
 
   it('an unknown or junk token reports "unknown" and writes nothing', async () => {

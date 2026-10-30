@@ -7,8 +7,9 @@
  * service-role key used here.
  *
  * Retry semantics: Stripe retries any non-2xx. So a *database* failure returns
- * 500 (please retry), while a verified-but-unusable event returns 200 (retrying
- * will not help).
+ * 500 (please retry), and so does a failed call back INTO Stripe (an outage, a
+ * 429, a timeout while re-reading the subscription — see `StripeReadError`),
+ * while a verified-but-unusable event returns 200 (retrying will not help).
  *
  * ── What was already right, and what was not ────────────────────────────────
  *
@@ -45,8 +46,13 @@
  */
 
 import { NextResponse } from 'next/server'
-import type Stripe from 'stripe'
-import { getStripe, isStripeConfigured, planIdForPriceId } from '@/lib/billing/stripe'
+import Stripe from 'stripe'
+import {
+  getStripe,
+  isStripeConfigured,
+  planIdForPriceId,
+  STRIPE_API_VERSION,
+} from '@/lib/billing/stripe'
 import {
   alreadyProcessed,
   applySubscription,
@@ -62,10 +68,112 @@ import {
   type EventStamp,
 } from '@/lib/billing/subscription'
 import type { PlanId, SubscriptionStatus } from '@/lib/plans'
+import { uuid } from '@/lib/security/validate'
+
+/** The only plans this app sells through Checkout. */
+function paidPlanId(value: unknown): PlanId | null {
+  return value === 'pro' || value === 'team' ? value : null
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
+}
 
 export const runtime = 'nodejs'
 
 const WEBHOOK_SECRET = (process.env.STRIPE_WEBHOOK_SECRET ?? '').trim()
+
+/**
+ * Thrown when a call back into Stripe failed for a reason a retry can fix.
+ *
+ * Two handlers re-read the subscription live (`checkout.session.completed`,
+ * `invoice.payment_failed`). That call used to sit inside the same try as the
+ * "verified but unusable event" catch, so a Stripe outage, 429 or timeout was
+ * ACKNOWLEDGED WITH 200 — and Stripe does not retry a 2xx. The event was not
+ * in the ledger either, so nothing said "come back for this". A paying
+ * customer whose checkout landed during a Stripe blip stayed on Free with no
+ * record of why.
+ */
+class StripeReadError extends Error {}
+
+/**
+ * Stripe error types a retry cannot fix: the request itself is wrong (a
+ * subscription id that does not exist, a bad key, a permission problem). Those
+ * stay "unusable" and get a 200. Everything else — connection errors, 5xx
+ * `api_error`s, rate limits, and any non-Stripe exception such as a socket
+ * timeout — is retryable and becomes a 500. Unknown is treated as retryable:
+ * the cost of one more delivery is nothing, the cost of a dropped one is a
+ * customer on the wrong plan until a reconciliation happens to run.
+ */
+const NON_RETRYABLE_STRIPE_TYPES: ReadonlySet<string> = new Set([
+  'StripeInvalidRequestError',
+  'StripeAuthenticationError',
+  'StripePermissionError',
+  'StripeIdempotencyError',
+  'StripeCardError',
+])
+
+async function retrieveSubscription(stripe: Stripe, id: string): Promise<Stripe.Subscription> {
+  try {
+    return await stripe.subscriptions.retrieve(id)
+  } catch (err) {
+    if (err instanceof Stripe.errors.StripeError && NON_RETRYABLE_STRIPE_TYPES.has(err.type)) {
+      throw err
+    }
+    throw new StripeReadError(err instanceof Error ? err.message : String(err))
+  }
+}
+
+/**
+ * The subscription an event is about, in the shape the pinned SDK is typed for.
+ *
+ * The shape of `event.data.object` follows the API version the Dashboard
+ * ENDPOINT was created with, not the one `stripe.ts` pins for outgoing calls.
+ * An endpoint on a newer version (2025-03-31.basil and later) delivers
+ * subscriptions without a top-level `current_period_end`, which would write a
+ * null renewal date over a good one on every event. So when the event's
+ * `api_version` is not the pinned one, the subscription is re-read through the
+ * pinned client, whose answer has the shape the rest of this module reads.
+ * When the versions agree the payload is used as delivered (no extra call).
+ */
+async function subscriptionInPinnedShape(
+  stripe: Stripe,
+  event: Stripe.Event
+): Promise<Stripe.Subscription | null> {
+  const object = event.data?.object as Stripe.Subscription | undefined
+  if (!isObject(object) || typeof object.id !== 'string' || object.id.length === 0) {
+    console.warn('[billing/webhook] subscription event without an object', event.id)
+    return null
+  }
+  if (event.api_version && event.api_version !== STRIPE_API_VERSION) {
+    if (!versionWarned) {
+      versionWarned = true
+      console.warn(
+        `[billing/webhook] endpoint API version ${event.api_version} differs from the pinned ` +
+          `${STRIPE_API_VERSION}; subscriptions are re-read through the pinned client. ` +
+          'Create the webhook endpoint with the pinned version (docs/BILLING.md §4).'
+      )
+    }
+    return retrieveSubscription(stripe, object.id)
+  }
+  return object
+}
+
+let versionWarned = false
+
+/**
+ * The subscription id on an `invoice.*` event. Older API versions carry it at
+ * `invoice.subscription`; 2025-03-31.basil and later moved it to
+ * `invoice.parent.subscription_details.subscription`.
+ */
+function invoiceSubscriptionId(invoice: Stripe.Invoice): string | null {
+  const direct = idOf((invoice as { subscription?: string | { id: string } | null }).subscription)
+  if (direct) return direct
+  const parent = (invoice as unknown as { parent?: unknown }).parent
+  if (!isObject(parent) || !isObject(parent.subscription_details)) return null
+  const nested = parent.subscription_details.subscription
+  return typeof nested === 'string' ? nested : isObject(nested) && typeof nested.id === 'string' ? nested.id : null
+}
 
 async function handleSubscriptionEvent(
   sub: Stripe.Subscription,
@@ -132,68 +240,83 @@ export async function POST(req: Request): Promise<Response> {
   try {
     switch (event.type) {
       case 'checkout.session.completed': {
-        const session = event.data.object as Stripe.Checkout.Session
-        const userId = (
-          session.client_reference_id ??
-          session.metadata?.userId ??
-          ''
-        ).trim()
-        if (!userId) {
-          console.warn('[billing/webhook] checkout.session.completed without a user id')
+        const session = event.data?.object as Stripe.Checkout.Session | undefined
+        if (!isObject(session)) {
+          console.warn('[billing/webhook] checkout.session.completed without an object')
           break
         }
-        const subscriptionId = idOf(session.subscription)
-        if (subscriptionId) {
-          // Fetch the subscription so plan, period end and status come from
-          // Stripe rather than being inferred from the session.
-          const sub = await stripe.subscriptions.retrieve(subscriptionId)
-          const priceId = firstPriceId(sub)
-          const planId =
-            (priceId ? planIdForPriceId(priceId) : null) ??
-            ((session.metadata?.planId as PlanId | undefined) ?? 'free')
-          await applySubscription(
-            {
-              userId,
-              stripeCustomerId: idOf(session.customer) ?? idOf(sub.customer),
-              stripeSubscriptionId: sub.id,
-              planId,
-              status: toStatus(sub.status),
-              currentPeriodEnd: isoFromUnix(sub.current_period_end),
-              cancelAtPeriodEnd: sub.cancel_at_period_end === true,
-            },
-            stamp
-          )
-        } else {
-          await applySubscription(
-            {
-              userId,
-              stripeCustomerId: idOf(session.customer),
-              stripeSubscriptionId: null,
-              planId: (session.metadata?.planId as PlanId | undefined) ?? 'free',
-              status: 'active',
-              currentPeriodEnd: null,
-              cancelAtPeriodEnd: false,
-            },
-            stamp
-          )
+        // Only a session THIS app created is applied. A Payment Link or a
+        // one-off Checkout the operator makes on the same Stripe account
+        // lets the buyer choose `client_reference_id` in the link URL, and
+        // /api/billing/checkout creates nothing but subscription-mode sessions
+        // that stamp the same user id into both fields.
+        if (session.mode !== 'subscription') {
+          console.info('[billing/webhook] ignoring non-subscription checkout session', event.id)
+          break
         }
+        const reference = (session.client_reference_id ?? '').trim()
+        const stamped = (session.metadata?.userId ?? '').trim()
+        if (!reference || reference !== stamped) {
+          console.warn(
+            '[billing/webhook] checkout.session.completed without a matching user id',
+            event.id
+          )
+          break
+        }
+        // A non-UUID would make the rpc fail with a non-"missing object" error
+        // and turn into a permanent 500 retry loop for three days.
+        const checkedUser = uuid(reference, 'userId')
+        if (!checkedUser.ok) {
+          console.warn('[billing/webhook] checkout session user id is not a UUID', event.id)
+          break
+        }
+        const userId = checkedUser.value
+        const subscriptionId = idOf(session.subscription)
+        if (!subscriptionId) {
+          console.warn('[billing/webhook] subscription checkout without a subscription', event.id)
+          break
+        }
+        // Fetch the subscription so plan, period end and status come from
+        // Stripe rather than being inferred from the session.
+        const sub = await retrieveSubscription(stripe, subscriptionId)
+        const priceId = firstPriceId(sub)
+        const planId =
+          (priceId ? planIdForPriceId(priceId) : null) ?? paidPlanId(session.metadata?.planId)
+        if (!planId) {
+          console.error('[billing/webhook] checkout session has no known paid plan', event.id)
+          break
+        }
+        await applySubscription(
+          {
+            userId,
+            stripeCustomerId: idOf(session.customer) ?? idOf(sub.customer),
+            stripeSubscriptionId: sub.id,
+            planId,
+            status: toStatus(sub.status),
+            currentPeriodEnd: isoFromUnix(sub.current_period_end),
+            cancelAtPeriodEnd: sub.cancel_at_period_end === true,
+          },
+          stamp
+        )
         break
       }
 
       case 'customer.subscription.created':
       case 'customer.subscription.updated': {
-        await handleSubscriptionEvent(event.data.object as Stripe.Subscription, stamp)
+        const sub = await subscriptionInPinnedShape(stripe, event)
+        if (sub) await handleSubscriptionEvent(sub, stamp)
         break
       }
 
       case 'customer.subscription.deleted': {
-        await handleSubscriptionEvent(event.data.object as Stripe.Subscription, stamp, 'canceled')
+        const sub = await subscriptionInPinnedShape(stripe, event)
+        if (sub) await handleSubscriptionEvent(sub, stamp, 'canceled')
         break
       }
 
       case 'invoice.payment_failed': {
-        const invoice = event.data.object as Stripe.Invoice
-        const subscriptionId = idOf(invoice.subscription)
+        const invoice = event.data?.object as Stripe.Invoice | undefined
+        const subscriptionId = isObject(invoice) ? invoiceSubscriptionId(invoice) : null
         if (!subscriptionId) {
           console.warn('[billing/webhook] invoice.payment_failed without a subscription')
           break
@@ -203,7 +326,7 @@ export async function POST(req: Request): Promise<Response> {
         // — Stripe can take a beat to move the subscription — but the ordering
         // stamp is what stops a late retry of this event from marking an
         // account delinquent after it has already recovered.
-        const sub = await stripe.subscriptions.retrieve(subscriptionId)
+        const sub = await retrieveSubscription(stripe, subscriptionId)
         await handleSubscriptionEvent(sub, stamp, 'past_due')
         break
       }
@@ -227,6 +350,17 @@ export async function POST(req: Request): Promise<Response> {
       // other route so that log is greppable by code.
       return NextResponse.json(
         { error: 'Could not persist the subscription.', code: 'internal' },
+        { status: 500 }
+      )
+    }
+    if (err instanceof StripeReadError) {
+      // Stripe itself could not be read (outage, 429, timeout). Transient, so
+      // it is asked to retry exactly like a database failure — a 200 here
+      // would drop the event for good. Not in the ledger, so the retry does
+      // the work rather than being skipped as a duplicate.
+      console.error('[billing/webhook] stripe read failed', err.message)
+      return NextResponse.json(
+        { error: 'Could not read the subscription from Stripe.', code: 'upstream_error' },
         { status: 500 }
       )
     }

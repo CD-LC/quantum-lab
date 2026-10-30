@@ -38,13 +38,14 @@
  */
 
 import { apiError, failure } from '@/lib/apiError'
+import { readBodyText } from '@/lib/security/validate'
 import { callerKey, rateLimit, retryAfterHeaders, type RateLimitRule } from '@/lib/rateLimit'
 import { getEntitlement } from '@/lib/billing/entitlements'
 import { assertFeature, FeatureLockedError, PLAN_BY_ID } from '@/lib/plans'
 import { newCertificateId, parseCertificateId } from '@/lib/certificate'
 import { featureForExam } from './access'
 import { getExam } from './catalogue'
-import { isLate, isExpired } from './clock'
+import { isLate, isExpired, RETAKE_COOLDOWN_MS, retakeAvailableAt } from './clock'
 import {
   gradeExam,
   questionsByIds,
@@ -86,6 +87,8 @@ const MAX_ANSWERS = 64
 const MAX_SELECTED_IDS = 12
 const MAX_ID_CHARS = 64
 const MAX_NAME_CHARS = 60
+/** 64 answers at a few hundred bytes each fit in a fraction of this. */
+const MAX_BODY_BYTES = 64 * 1024
 
 // ────────────────────────────────────────────────────────────
 // Small helpers
@@ -169,9 +172,24 @@ function featureLocked(err: FeatureLockedError): Response {
   )
 }
 
-async function readBody(req: Request): Promise<Record<string, unknown>> {
+/**
+ * Read a JSON object body, refusing anything over `MAX_BODY_BYTES`.
+ *
+ * `req.json()` buffers and parses whatever it is given, so before this cap an
+ * anonymous caller could make the process parse a multi-megabyte body on every
+ * write route. The declared length is checked first (cheap), and the stream is
+ * then counted as it is read so a lying or absent `content-length` cannot get
+ * past it. Callers run the rate limit BEFORE calling this.
+ *
+ * An unparseable body is `{}`, as before; only an oversized one is refused.
+ */
+async function readBody(req: Request): Promise<Record<string, unknown> | Response> {
+  const read = await readBodyText(req, MAX_BODY_BYTES)
+  if (!read.ok) return read.tooLarge ? apiError('payload_too_large') : {}
+  const raw = read.value
+
   try {
-    const parsed: unknown = await req.json()
+    const parsed: unknown = JSON.parse(raw)
     return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
       ? (parsed as Record<string, unknown>)
       : {}
@@ -218,7 +236,7 @@ function normalizeAnswers(
   return out
 }
 
-function toClientAttempt(a: ServerAttempt): ClientAttempt {
+function toClientAttempt(a: ServerAttempt, now: number = Date.now()): ClientAttempt {
   const client: ClientAttempt = {
     id: a.id,
     examId: a.examId,
@@ -226,6 +244,7 @@ function toClientAttempt(a: ServerAttempt): ClientAttempt {
     expiresAt: a.expiresAt,
     answers: a.answers,
     certifiable: a.subjectKind === 'user',
+    serverNow: new Date(now).toISOString(),
   }
   if (a.submittedAt) client.submittedAt = a.submittedAt
   return client
@@ -317,9 +336,15 @@ async function finalise(
       review: grade.graded.map((g) => shuffleOptionsFor(toReviewQuestion(g), closed.id)),
       answers: closed.answers,
       certifiable: closed.subjectKind === 'user',
+      ...retakeField(closed),
       ...(closed.certificateId ? { certificateId: closed.certificateId } : {}),
     },
   }
+}
+
+function retakeField(a: ServerAttempt): { retakeAvailableAt?: string } {
+  const at = retakeAvailableAt(a.submittedAt, a.passed)
+  return at ? { retakeAvailableAt: at } : {}
 }
 
 /** Rebuild the result payload for an attempt that is already closed. */
@@ -347,6 +372,7 @@ function replayResult(attempt: ServerAttempt, exam: Exam): ExamResultPayload {
     review: grade.graded.map((g) => shuffleOptionsFor(toReviewQuestion(g), attempt.id)),
     answers: attempt.answers,
     certifiable: attempt.subjectKind === 'user',
+    ...retakeField(attempt),
     ...(attempt.certificateId ? { certificateId: attempt.certificateId } : {}),
   }
 }
@@ -371,10 +397,16 @@ interface Loaded {
   resolved: ResolvedSubject
   exam: Exam
   attempt: ServerAttempt
+  body: Record<string, unknown>
 }
 
 /**
  * Load an attempt and prove the caller owns it.
+ *
+ * Order matters and is the chain at the top of this file: exam, subject, RATE
+ * LIMIT, then the request body, then the store read. The body is parsed (and
+ * size-capped) only after the limiter has let the request through, so a flood
+ * of oversized bodies is refused before it costs a parse.
  *
  * A caller who names an attempt that is not theirs gets 404, not 403: 403 would
  * confirm the id exists. There is nothing sensitive in the existence of an
@@ -383,30 +415,35 @@ interface Loaded {
 async function loadOwned(
   req: Request,
   examId: string,
-  attemptId: unknown,
   prefix: string,
   rule: RateLimitRule
 ): Promise<Loaded | Response> {
   const exam = getExam(examId)
   if (!exam) return apiError('not_found', { message: 'There is no exam with that id.' })
-  if (typeof attemptId !== 'string' || attemptId.length === 0 || attemptId.length > MAX_ID_CHARS) {
-    return apiError('bad_request', { message: 'attemptId is required.' })
-  }
 
   const resolved = await resolveSubject(req)
-  // The limit runs BEFORE the store read, which is what the chain at the top of
-  // this file claims and what the three write paths used to get wrong: they
-  // called this function first and limited afterwards, so every refused request
-  // had already cost one `getAttempt` against the exam store. Combined with the
-  // fresh-guest bucket bug above, that made an unauthenticated read amplifier.
+  // A token was presented but could not be accepted: 401 (invalid) or 503
+  // (auth service unreachable), never a silent downgrade to a guest.
+  if (resolved.denied) return resolved.denied
+  // The limit runs BEFORE the body parse and the store read: every refused
+  // request would otherwise have cost a JSON parse and one `getAttempt`
+  // against the exam store, an unauthenticated amplifier.
   const limited = await limitOrNull(req, prefix, rule, limitKeyFor(resolved))
   if (limited) return withSubjectCookie(limited, resolved)
 
+  const body = await readBody(req)
+  if (body instanceof Response) return withSubjectCookie(body, resolved)
+
+  const attemptId = body.attemptId
+  if (typeof attemptId !== 'string' || attemptId.length === 0 || attemptId.length > MAX_ID_CHARS) {
+    return withSubjectCookie(apiError('bad_request', { message: 'attemptId is required.' }), resolved)
+  }
+
   const attempt = await getExamStore().getAttempt(attemptId)
   if (!attempt || attempt.subjectId !== resolved.subject.id || attempt.examId !== exam.id) {
-    return apiError('not_found', { message: 'That attempt does not exist.' })
+    return withSubjectCookie(apiError('not_found', { message: 'That attempt does not exist.' }), resolved)
   }
-  return { resolved, exam, attempt }
+  return { resolved, exam, attempt, body }
 }
 
 // ────────────────────────────────────────────────────────────
@@ -430,6 +467,9 @@ export async function currentState(req: Request, examId: string): Promise<Respon
   if (!exam) return apiError('not_found', { message: 'There is no exam with that id.' })
 
   const resolved = await resolveSubject(req)
+  // A token was presented but could not be accepted: 401 (invalid) or 503
+  // (auth service unreachable), never a silent downgrade to a guest.
+  if (resolved.denied) return resolved.denied
   const limited = await limitOrNull(req, 'exam-state', READ_LIMIT, limitKeyFor(resolved))
   if (limited) return limited
 
@@ -460,7 +500,7 @@ export async function currentState(req: Request, examId: string): Promise<Respon
       }
       const body: AttemptState = {
         state: 'open',
-        attempt: toClientAttempt(latest),
+        attempt: toClientAttempt(latest, now),
         paper: paperFor(latest),
         durable: store.durable,
       }
@@ -491,6 +531,9 @@ export async function startAttempt(req: Request, examId: string): Promise<Respon
   if (!exam) return apiError('not_found', { message: 'There is no exam with that id.' })
 
   const resolved = await resolveSubject(req)
+  // A token was presented but could not be accepted: 401 (invalid) or 503
+  // (auth service unreachable), never a silent downgrade to a guest.
+  if (resolved.denied) return resolved.denied
   const limited = await limitOrNull(req, 'exam-start', START_LIMIT, limitKeyFor(resolved))
   if (limited) return limited
 
@@ -505,18 +548,46 @@ export async function startAttempt(req: Request, examId: string): Promise<Respon
     if (latest && !latest.submittedAt && !isExpired(latest.expiresAt, now)) {
       const body: AttemptState = {
         state: 'open',
-        attempt: toClientAttempt(latest),
+        attempt: toClientAttempt(latest, now),
         paper: paperFor(latest),
         durable: store.durable,
       }
       return withSubjectCookie(json(body), resolved)
     }
 
+    let previous: ServerAttempt | undefined = latest ?? undefined
     if (latest && !latest.submittedAt) {
       // Its clock ran out before this request. Close it on the record before
       // dealing a new paper, so history shows a sat-and-expired attempt rather
       // than an attempt that dangles open forever.
-      await finalise(latest, exam, 'expiry', now)
+      previous = (await finalise(latest, exam, 'expiry', now)).attempt
+    }
+
+    // Retake cooldown. A review shows the key for every question the candidate
+    // answered, so "answer everything, read the key, start again" would harvest
+    // the whole bank at the start limit. After a FAILED paper the next one is
+    // dealt only once the cooldown has passed. A pass is never delayed, and
+    // neither is a first attempt.
+    const waitUntil = previous
+      ? retakeAvailableAt(previous.submittedAt, previous.passed)
+      : undefined
+    if (waitUntil && Date.parse(waitUntil) > now) {
+      const retryAfter = Math.max(1, Math.ceil((Date.parse(waitUntil) - now) / 1000))
+      const minutes = Math.ceil(RETAKE_COOLDOWN_MS / 60_000)
+      return withSubjectCookie(
+        new Response(
+          JSON.stringify({
+            error: `You can sit this exam again at ${waitUntil}. There is a ${minutes}-minute wait after a paper that did not pass — use it to revise the lessons the review names.`,
+            code: 'rate_limited',
+            retakeAvailableAt: waitUntil,
+          }),
+          {
+            status: 429,
+            headers: { 'content-type': 'application/json', 'retry-after': String(retryAfter) },
+          }
+        ),
+        resolved
+      )
     }
 
     const id = newAttemptId()
@@ -539,7 +610,7 @@ export async function startAttempt(req: Request, examId: string): Promise<Respon
 
     const body: AttemptState = {
       state: 'open',
-      attempt: toClientAttempt(attempt),
+      attempt: toClientAttempt(attempt, now),
       paper: paperFor(attempt),
       durable: store.durable,
     }
@@ -554,10 +625,9 @@ export async function startAttempt(req: Request, examId: string): Promise<Respon
  * another cannot un-answer a question the candidate has already answered.
  */
 export async function saveAnswers(req: Request, examId: string): Promise<Response> {
-  const body = await readBody(req)
-  const loaded = await loadOwned(req, examId, body.attemptId, 'exam-answers', ANSWER_LIMIT)
+  const loaded = await loadOwned(req, examId, 'exam-answers', ANSWER_LIMIT)
   if (loaded instanceof Response) return loaded
-  const { resolved, exam, attempt } = loaded
+  const { resolved, exam, attempt, body } = loaded
 
   if (attempt.submittedAt) {
     return withSubjectCookie(
@@ -611,10 +681,9 @@ export async function saveAnswers(req: Request, examId: string): Promise<Respons
  * rather than an error with no way forward.
  */
 export async function submitAttempt(req: Request, examId: string): Promise<Response> {
-  const body = await readBody(req)
-  const loaded = await loadOwned(req, examId, body.attemptId, 'exam-submit', START_LIMIT)
+  const loaded = await loadOwned(req, examId, 'exam-submit', START_LIMIT)
   if (loaded instanceof Response) return loaded
-  const { resolved, exam, attempt } = loaded
+  const { resolved, exam, attempt, body } = loaded
 
   try {
     // Already graded: return the same marks rather than regrading. A retried
@@ -663,10 +732,9 @@ export async function submitAttempt(req: Request, examId: string): Promise<Respo
  * the candidate supplies, it is self-attested, and `/verify` says so.
  */
 export async function claimCertificate(req: Request, examId: string): Promise<Response> {
-  const body = await readBody(req)
-  const loaded = await loadOwned(req, examId, body.attemptId, 'exam-cert', START_LIMIT)
+  const loaded = await loadOwned(req, examId, 'exam-cert', START_LIMIT)
   if (loaded instanceof Response) return loaded
-  const { resolved, exam, attempt } = loaded
+  const { resolved, exam, attempt, body } = loaded
 
   if (attempt.subjectKind !== 'user') {
     return withSubjectCookie(
@@ -821,6 +889,9 @@ interface ExamSummary {
 
 export async function examSummary(req: Request): Promise<Response> {
   const resolved = await resolveSubject(req)
+  // A token was presented but could not be accepted: 401 (invalid) or 503
+  // (auth service unreachable), never a silent downgrade to a guest.
+  if (resolved.denied) return resolved.denied
   const limited = await limitOrNull(req, 'exam-summary', READ_LIMIT, limitKeyFor(resolved))
   if (limited) return limited
 

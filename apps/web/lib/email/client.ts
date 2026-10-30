@@ -20,7 +20,28 @@ export const FROM_ADDRESS: string =
 
 const isDevelopment = process.env.NODE_ENV === 'development'
 
-export type SendResult = { sent: true; id: string } | { sent: false; reason: string }
+/**
+ * `retryable` is set ONLY when the provider DEFINITIVELY did not accept the
+ * message and a later attempt is expected to work (HTTP 429, or a 5xx). A
+ * thrown/network error is deliberately not marked: the request may have
+ * reached the provider, so retrying it could deliver the message twice.
+ */
+export type SendResult =
+  | { sent: true; id: string }
+  | { sent: false; reason: string; retryable?: boolean }
+
+const RETRYABLE_ERROR_NAMES = new Set([
+  'rate_limit_exceeded',
+  'daily_quota_exceeded',
+  'application_error',
+  'internal_server_error',
+])
+
+function isRetryableProviderError(error: { name?: unknown; statusCode?: unknown }): boolean {
+  const status = typeof error.statusCode === 'number' ? error.statusCode : null
+  if (status !== null) return status === 429 || status >= 500
+  return typeof error.name === 'string' && RETRYABLE_ERROR_NAMES.has(error.name)
+}
 
 export interface SendEmailInput {
   to: string
@@ -29,7 +50,13 @@ export interface SendEmailInput {
   text: string
 }
 
-const NOT_CONFIGURED_REASON =
+/**
+ * The one `reason` a route may echo verbatim: it is this app's own copy, names
+ * no provider state, and is what the zero-config developer flow reads. Every
+ * other reason is a provider or network message for the server log only — see
+ * POST /api/email.
+ */
+export const NOT_CONFIGURED_REASON =
   'Email is not configured; set RESEND_API_KEY to send messages. ' +
   'The message was not delivered.'
 
@@ -120,7 +147,11 @@ export async function sendEmail(input: SendEmailInput): Promise<SendResult> {
     })
 
     if (result.error) {
-      return { sent: false, reason: result.error.message || 'The email provider rejected the message.' }
+      return {
+        sent: false,
+        reason: result.error.message || 'The email provider rejected the message.',
+        ...(isRetryableProviderError(result.error) ? { retryable: true } : {}),
+      }
     }
     if (!result.data?.id) {
       return { sent: false, reason: 'The email provider returned no message id.' }

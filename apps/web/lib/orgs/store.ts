@@ -558,7 +558,7 @@ export async function createOrg(input: CreateOrgInput, ctx?: OrgContext): Promis
       if (!error && data) {
         const org = rowToOrg(data as OrgRow)
         // The creator always takes the first seat as owner.
-        await supabase.from('org_members').insert({
+        const seat = await supabase.from('org_members').insert({
           org_id: org.id,
           user_id: ownerId,
           email: input.ownerEmail,
@@ -566,6 +566,13 @@ export async function createOrg(input: CreateOrgInput, ctx?: OrgContext): Promis
           status: 'active',
           plan_id: input.planId,
         })
+        if (seat?.error) {
+          // An org with no owner seat is unreachable by everyone, including its
+          // creator, and still counts as "created". Take it back out and fail,
+          // so the caller can retry instead of being told it worked.
+          await supabase.from('orgs').delete().eq('id', org.id)
+          throw new Error(seat.error.message ?? 'Could not create the owner seat.')
+        }
         return org
       }
       if (ctx) throw new Error(error?.message ?? 'Could not create the organisation.')
@@ -696,12 +703,25 @@ export async function seatUsage(orgId: string, ctx?: OrgContext): Promise<SeatUs
  * Add a seat. Throws SeatLimitError when the licence is full — see the note on
  * that class: this is the courtesy check, the API route enforces it again.
  */
+export interface AddMemberOptions {
+  /**
+   * The auth.users id to bind the seat to at insert time. Set ONLY by the
+   * invite-acceptance route, from the Supabase-verified caller — every
+   * authorisation check (lib/orgs/access.ts, entitlements.ts, the RLS helpers)
+   * keys on `org_members.user_id`, so a seat written without it is a seat
+   * nobody can use. An admin minting an invite leaves it unset: the row is
+   * held by email until the invitee claims it.
+   */
+  userId?: string
+}
+
 export async function addMember(
   orgId: string,
   email: string,
   role: OrgRole,
   status: OrgMemberStatus = 'invited',
-  ctx?: OrgContext
+  ctx?: OrgContext,
+  options: AddMemberOptions = {}
 ): Promise<OrgMember> {
   const trimmed = email.trim().toLowerCase()
   const org = await getOrg(orgId, ctx)
@@ -728,12 +748,28 @@ export async function addMember(
           role,
           status,
           plan_id: org?.planId ?? 'team',
+          ...(options.userId ? { user_id: options.userId } : {}),
         })
         .select('*')
         .single()
       if (!error && data) {
+        const inserted = rowToMember(data as OrgMemberRow)
+        // Seat-cap race. The check above and this insert are two statements,
+        // and the service-role client bypasses the database's seat-cap
+        // trigger, so two concurrent invites can both pass the check and
+        // overshoot the licence. Re-count now that our row exists; if we are
+        // over, take it back out and refuse.
+        if (ctx && consumesSeat(status) && (await seatsExceeded(orgId, ctx))) {
+          await backend.supabase
+            .from('org_members')
+            .delete()
+            .eq('id', inserted.id)
+            .eq('org_id', orgId)
+          await syncSeatsUsed(orgId, ctx)
+          throw new SeatLimitError(used, total)
+        }
         await syncSeatsUsed(orgId, ctx)
-        return rowToMember(data as OrgMemberRow)
+        return inserted
       }
       if (ctx) throw new Error(error?.message ?? 'Could not add that member.')
     } catch (err) {
@@ -748,7 +784,7 @@ export async function addMember(
   const member: OrgMember = {
     id: newId('member'),
     orgId,
-    userId: '',
+    userId: options.userId ?? '',
     email: trimmed,
     role,
     status,
@@ -768,12 +804,22 @@ export async function removeMember(
   const backend = await remote(ctx)
   if (backend) {
     try {
+      // Read the seat's email first: removing the seat must also kill any
+      // invite link still outstanding for that address (see revokeInvites).
+      const { data: seat } = await backend.supabase
+        .from('org_members')
+        .select('email')
+        .eq('id', memberId)
+        .eq('org_id', orgId)
+        .maybeSingle()
       const { error } = await backend.supabase
         .from('org_members')
         .delete()
         .eq('id', memberId)
         .eq('org_id', orgId)
       if (!error) {
+        const seatEmail = (seat as { email?: unknown } | null)?.email
+        if (typeof seatEmail === 'string') await revokeInvites(orgId, seatEmail, ctx)
         await syncSeatsUsed(orgId, ctx)
         return true
       }
@@ -785,9 +831,18 @@ export async function removeMember(
   }
 
   const db = readLocal()
+  const removed = db.members.find((m) => m.id === memberId && m.orgId === orgId)
   const members = db.members.filter((m) => !(m.id === memberId && m.orgId === orgId))
   if (members.length === db.members.length) return false
-  writeLocal({ ...db, members, orgs: withSeatCount(db.orgs, orgId, members) })
+  const burnedAt = new Date().toISOString()
+  const invites = removed
+    ? db.invites.map((i) =>
+        i.orgId === orgId && i.email === removed.email.toLowerCase() && !i.acceptedAt
+          ? { ...i, acceptedAt: burnedAt }
+          : i
+      )
+    : db.invites
+  writeLocal({ ...db, members, invites, orgs: withSeatCount(db.orgs, orgId, members) })
   return true
 }
 
@@ -806,23 +861,94 @@ export async function setMemberStatus(
   status: OrgMemberStatus,
   ctx?: OrgContext
 ): Promise<OrgMember | null> {
-  // Re-activating a suspended member re-takes a seat, so re-check capacity.
-  if (status === 'active') {
-    const [org, members] = await Promise.all([getOrg(orgId, ctx), listMembers(orgId, ctx)])
-    const target = members.find((m) => m.id === memberId)
-    const total = org?.seatsTotal ?? 0
-    const used = countSeats(members)
-    if (target && !consumesSeat(target.status) && Number.isFinite(total) && used + 1 > total) {
-      throw new SeatLimitError(used, total)
-    }
+  // Any status that holds a seat ('active' AND 'invited') re-takes one when the
+  // member was suspended, so re-check capacity. Checking only 'active' let a
+  // suspended seat be flipped to 'invited' past the cap.
+  if (consumesSeat(status)) await assertSeatForActivation(orgId, memberId, ctx)
+  const before = ctx ? (await listMembers(orgId, ctx)).find((m) => m.id === memberId) : undefined
+  const updated = await patchMember(orgId, memberId, { status }, ctx)
+  if (!updated) return updated
+  if (status === 'suspended') await revokeInvites(orgId, updated.email, ctx)
+  return rollBackIfOverCap(orgId, memberId, before, updated, ctx)
+}
+
+/**
+ * Seat-cap race guard for a status change made through the service-role client
+ * (which skips the database's cap trigger). The pre-check and the write are two
+ * statements, so re-count once the write has landed; if the licence is now
+ * over, put the seat back to its previous status and refuse. Only meaningful
+ * server-side (`ctx` set) and only when the change took a seat.
+ */
+async function rollBackIfOverCap(
+  orgId: string,
+  memberId: string,
+  before: OrgMember | undefined,
+  updated: OrgMember,
+  ctx?: OrgContext
+): Promise<OrgMember> {
+  if (!ctx || !before) return updated
+  if (consumesSeat(before.status) || !consumesSeat(updated.status)) return updated
+  if (!(await seatsExceeded(orgId, ctx))) return updated
+  await patchMember(orgId, memberId, { status: before.status }, ctx)
+  const [org, members] = await Promise.all([getOrg(orgId, ctx), listMembers(orgId, ctx)])
+  throw new SeatLimitError(countSeats(members), org?.seatsTotal ?? 0)
+}
+
+/** True when more seats are held than the licence allows. */
+async function seatsExceeded(orgId: string, ctx?: OrgContext): Promise<boolean> {
+  const [org, members] = await Promise.all([getOrg(orgId, ctx), listMembers(orgId, ctx)])
+  const total = org?.seatsTotal ?? 0
+  return Number.isFinite(total) && countSeats(members) > total
+}
+
+/**
+ * Bind a held seat to the account that claimed it and make it active.
+ *
+ * ── Why a dedicated call (invite acceptance bug) ─────────────
+ * An invited seat is minted by email alone — the person may not have an
+ * auth.users row yet — so `org_members.user_id` is NULL until they accept.
+ * Acceptance used to call `setMemberStatus(…, 'active')`, which writes only
+ * `status`: the seat turned green in the admin console while every check that
+ * matters (`requireOrgRole`, `getEntitlement`, the `is_org_member` RLS helper,
+ * the progress routes) kept looking for a row with THIS user's id and found
+ * none. Every invitee was locked out of the seat they had just claimed.
+ *
+ * `userId` must be the Supabase-VERIFIED caller whose email matched the
+ * invite — app/api/orgs/invite/accept/route.ts is the only legitimate caller.
+ * Returns null when the write failed; the caller must not report success.
+ */
+export async function claimSeat(
+  orgId: string,
+  memberId: string,
+  userId: string,
+  ctx?: OrgContext
+): Promise<OrgMember | null> {
+  await assertSeatForActivation(orgId, memberId, ctx)
+  const before = ctx ? (await listMembers(orgId, ctx)).find((m) => m.id === memberId) : undefined
+  const claimed = await patchMember(orgId, memberId, { status: 'active', userId }, ctx)
+  if (!claimed) return claimed
+  return rollBackIfOverCap(orgId, memberId, before, claimed, ctx)
+}
+
+/** Throws SeatLimitError if making `memberId` active would exceed the licence. */
+async function assertSeatForActivation(
+  orgId: string,
+  memberId: string,
+  ctx?: OrgContext
+): Promise<void> {
+  const [org, members] = await Promise.all([getOrg(orgId, ctx), listMembers(orgId, ctx)])
+  const target = members.find((m) => m.id === memberId)
+  const total = org?.seatsTotal ?? 0
+  const used = countSeats(members)
+  if (target && !consumesSeat(target.status) && Number.isFinite(total) && used + 1 > total) {
+    throw new SeatLimitError(used, total)
   }
-  return patchMember(orgId, memberId, { status }, ctx)
 }
 
 async function patchMember(
   orgId: string,
   memberId: string,
-  patch: { role?: OrgRole; status?: OrgMemberStatus },
+  patch: { role?: OrgRole; status?: OrgMemberStatus; userId?: string },
   ctx?: OrgContext
 ): Promise<OrgMember | null> {
   const backend = await remote(ctx)
@@ -831,6 +957,7 @@ async function patchMember(
       const fields: Record<string, string> = {}
       if (patch.role) fields.role = patch.role
       if (patch.status) fields.status = patch.status
+      if (patch.userId) fields.user_id = patch.userId
       const { data, error } = await backend.supabase
         .from('org_members')
         .update(fields)
@@ -856,6 +983,7 @@ async function patchMember(
     ...db.members[index],
     role: patch.role ?? db.members[index].role,
     status: patch.status ?? db.members[index].status,
+    userId: patch.userId ?? db.members[index].userId,
   }
   const members = [...db.members]
   members[index] = next
@@ -1000,6 +1128,75 @@ export async function markInviteAccepted(
   if (db.invites[index].acceptedAt) return false
   const invites = [...db.invites]
   invites[index] = { ...invites[index], acceptedAt }
+  writeLocal({ ...db, invites })
+  return true
+}
+
+/**
+ * Burn every outstanding invite for `email` in `orgId` (best effort).
+ *
+ * Removing or suspending a seat used to leave its invite link live for the rest
+ * of the 14-day TTL, and accepting it re-created the seat with the invite's
+ * role. The row is stamped `accepted_at` rather than deleted so there is still
+ * a record that a link existed. The accept route independently refuses an
+ * invite whose held seat is gone or suspended; this is the belt to that braces.
+ */
+export async function revokeInvites(
+  orgId: string,
+  email: string,
+  ctx?: OrgContext
+): Promise<void> {
+  const address = email.trim().toLowerCase()
+  const burnedAt = new Date().toISOString()
+  const backend = await remote(ctx)
+  if (backend) {
+    try {
+      await backend.supabase
+        .from('org_invites')
+        .update({ accepted_at: burnedAt })
+        .eq('org_id', orgId)
+        .eq('email', address)
+        .is('accepted_at', null)
+    } catch {
+      // Best effort: the accept route re-checks the seat itself.
+    }
+    return
+  }
+  const db = readLocal()
+  writeLocal({
+    ...db,
+    invites: db.invites.map((i) =>
+      i.orgId === orgId && i.email === address && !i.acceptedAt ? { ...i, acceptedAt: burnedAt } : i
+    ),
+  })
+}
+
+/**
+ * Undo `markInviteAccepted` when the seat claim that followed it failed, so the
+ * invitee keeps a working link instead of a burned one. Only ever called by the
+ * accept route, on the invite it burned moments earlier. Returns true if the
+ * invite was restored.
+ */
+export async function releaseInvite(inviteId: string, ctx?: OrgContext): Promise<boolean> {
+  const backend = await remote(ctx)
+  if (backend) {
+    try {
+      const { data, error } = await backend.supabase
+        .from('org_invites')
+        .update({ accepted_at: null })
+        .eq('id', inviteId)
+        .select('id')
+      return !error && Array.isArray(data) && data.length > 0
+    } catch {
+      return false
+    }
+  }
+  const db = readLocal()
+  const index = db.invites.findIndex((i) => i.id === inviteId)
+  if (index === -1) return false
+  const invites = [...db.invites]
+  const { acceptedAt: _acceptedAt, ...rest } = invites[index]
+  invites[index] = rest
   writeLocal({ ...db, invites })
   return true
 }

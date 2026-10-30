@@ -281,10 +281,16 @@ export function QuestionCard({
       {reviewMode && graded ? (
         <div className="card mt-4 bg-surface-2 p-4">
           <p className="text-[13px] leading-relaxed text-ink-secondary">
-            <span className="mr-2 text-[11px] font-bold uppercase tracking-[0.09em] text-q-violet">
-              Why
-            </span>
-            {graded.explanation}
+            {graded.explanation ? (
+              <>
+                <span className="mr-2 text-[11px] font-bold uppercase tracking-[0.09em] text-q-violet">
+                  Why
+                </span>
+                {graded.explanation}
+              </>
+            ) : (
+              'You left this one blank, so the answer and explanation are not shown. Answer every question to see the full review.'
+            )}
           </p>
           <Link
             href={`/learn/${question.lessonSlug}`}

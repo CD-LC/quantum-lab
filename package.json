@@ -14,7 +14,7 @@
     "api": "cd services/api && uvicorn app.main:app --reload --port 8000"
   },
   "engines": {
-    "node": ">=18.17"
+    "node": ">=22"
   },
   "devDependencies": {
     "supabase": "^2.116.0"
