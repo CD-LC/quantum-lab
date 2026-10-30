@@ -183,12 +183,17 @@ export default function SimulatorPage() {
     }
   }, [circuit])
   const { frames, finalState, notice: simNotice } = stepsResult
+  // `frames` can be a PREFIX of the circuit's steps (a long circuit on a wide
+  // register keeps only so many), so frames[last] is the final state only when
+  // nothing was cut. Anything at or past the last gate reads finalState, which
+  // is always exact; a step in the cut-off range (the transport does not offer
+  // one) clamps to the last kept frame rather than reading off the end.
   const displayState = useMemo(
     () =>
-      stepIndex === null
+      stepIndex === null || stepIndex >= circuit.ops.length
         ? finalState
-        : frames[Math.min(stepIndex, frames.length - 1)],
-    [frames, finalState, stepIndex]
+        : frames[Math.min(Math.max(stepIndex, 0), frames.length - 1)],
+    [circuit.ops.length, frames, finalState, stepIndex]
   )
   const qasm = useMemo(() => toQasm(circuit), [circuit])
 
@@ -650,6 +655,7 @@ export default function SimulatorPage() {
             // Same memo the inspector reads — the grid's inline column probe
             // is a lookup into these frames, never a second simulation.
             frames={frames}
+            finalState={finalState}
           />
         </section>
       </div>
@@ -768,6 +774,15 @@ export default function SimulatorPage() {
                   unit="shots"
                 />
               )}
+              {result.approximate ? (
+                // Mid-circuit measurement past what can be enumerated exactly:
+                // say the chart is an estimate instead of presenting it as exact.
+                <p className="mt-3 text-xs text-q-amber-text" role="status">
+                  Estimate: this circuit measures and branches too much to enumerate exactly, so
+                  these outcomes are averaged over {result.trajectories?.toLocaleString('en-US')}{' '}
+                  sampled runs. Measuring only at the end of the circuit is always exact.
+                </p>
+              ) : null}
               <div className="mt-4">
                 <Toggle label="Show as table" checked={showTable} onChange={setShowTable} />
               </div>
@@ -788,6 +803,7 @@ export default function SimulatorPage() {
           <StepInspector
             circuit={circuit}
             frames={frames}
+            finalState={finalState}
             step={stepIndex}
             onStepChange={handleStepChange}
           />

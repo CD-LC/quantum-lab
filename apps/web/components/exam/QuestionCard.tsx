@@ -189,7 +189,7 @@ export function QuestionCard({
               {graded.correct ? 'Your answer was correct.' : 'Your answer was incorrect.'}
             </span>
           ) : null}
-          {reviewMode && graded && !graded.correct ? (
+          {reviewMode && graded && !graded.correct && graded.correctNumber !== undefined ? (
             <p className="mt-2 text-[13px] text-q-teal-text">
               <span aria-hidden="true" className="mr-1.5 font-bold">
                 ✓

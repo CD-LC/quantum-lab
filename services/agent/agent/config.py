@@ -113,6 +113,9 @@ class Settings(BaseSettings):
     #: route.ts): a run the web has already abandoned is billed and discarded.
     #: The check is made between tool rounds, so one round may overshoot it by
     #: up to ``llm_request_timeout``; each tool call is bounded separately.
+    #: A run that hits this limit is reported as a failure (502), not a reply,
+    #: so the web falls back to the next tier; keep it <= 22 so that fallback
+    #: still has room inside the web's 25 s budget.
     max_agent_seconds: float = 20.0
 
     #: Per-call timeout handed to the LLM client. LiteLLM's own default is 600 s,

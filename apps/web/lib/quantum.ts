@@ -1217,8 +1217,8 @@ export function branchLimit(numQubits: number, requested: number = MAX_BRANCHES)
 
 /** Thrown by outcomeBranches() when the tree outgrows its branch or memory bound. */
 export class BranchLimitError extends Error {
-  constructor(readonly limit: number) {
-    super(`circuit has more than ${limit} measurement branches; sample with execute() instead`)
+  constructor(readonly limit: number, reason?: string) {
+    super(reason ?? `circuit has more than ${limit} measurement branches; sample with execute() instead`)
     this.name = 'BranchLimitError'
   }
 }
@@ -1405,6 +1405,170 @@ function sampledProbabilities(circuit: Circuit, samples: number, rng: () => numb
 }
 
 /**
+ * The circuit with every measurement that cannot change the answer removed.
+ *
+ * A MEASURE on a qubit that no later op touches, whose classical bit no later
+ * op reads, only dephases a qubit nobody looks at again. The output
+ * distribution over basis states, which is all run() reports, is the diagonal
+ * of the final density matrix, and dephasing a qubit leaves the diagonal alone.
+ * Summed over its two branches, P(i) = sum_m p_m * |psi_i|^2 / p_m = |psi_i|^2
+ * for every basis state i. So the standard "measure all qubits at the end" costs
+ * no branching at all, and a mid-circuit-measured circuit only has to branch on
+ * the measurements that really are mid-circuit.
+ *
+ * Returns the same object when nothing is removed.
+ */
+export function withoutTerminalMeasurements(circuit: Circuit): Circuit {
+  const touched = new Set<number>()
+  const readBits = new Set<number>()
+  const keep = new Array<boolean>(circuit.ops.length).fill(true)
+  let dropped = 0
+  for (let i = circuit.ops.length - 1; i >= 0; i--) {
+    const op = circuit.ops[i]
+    if (op.name === 'BARRIER') continue
+    if (op.name === 'MEASURE') {
+      const q = op.qubits[0]
+      if (!touched.has(q) && (op.clbit === undefined || !readBits.has(op.clbit))) {
+        keep[i] = false
+        dropped++
+        continue
+      }
+    }
+    for (const q of op.qubits) touched.add(q)
+    if (op.extraControls) for (const ec of op.extraControls) touched.add(ec.qubit)
+    if (op.condition) readBits.add(op.condition.bit)
+  }
+  if (dropped === 0) return circuit
+  return { ...circuit, ops: circuit.ops.filter((_, i) => keep[i]) }
+}
+
+/** Probabilities of a circuit that is just gates (no measurement semantics). */
+function unitaryProbabilities(circuit: Circuit): number[] {
+  const sv = new StateVector(circuit.numQubits)
+  prepInitialStates(sv, circuit)
+  for (const op of circuit.ops) sv.apply(op)
+  return sv.normalize().probabilities()
+}
+
+/**
+ * Amplitude updates the depth-first exact enumeration may spend (each gate,
+ * collapse, clone and leaf costs one pass over 2^n amplitudes). Past it the
+ * caller samples and says so.
+ */
+const EXACT_WORK_BUDGET = 1.5e8
+
+/**
+ * The exact mixture over every measurement outcome, the same numbers as
+ * outcomeProbabilities(), but depth-first.
+ *
+ * outcomeBranches() holds every leaf at once, so its memory bound cuts a
+ * 16-qubit circuit off at 32 branches. Only the diagonal is wanted here, so a
+ * leaf is folded into the accumulator and dropped, and the tree holds one
+ * state per level of the path (a handful) instead of one per leaf. What is left
+ * to bound is the time: a work budget, and the same 4,096-leaf ceiling.
+ * Throws BranchLimitError when either is exceeded.
+ */
+function exactOutcomeProbabilities(circuit: Circuit, workBudget: number = EXACT_WORK_BUDGET): number[] {
+  const n = circuit.numQubits
+  const dim = 1 << n
+  const numClbits = classicalBitCount(circuit)
+  const ops = circuit.ops
+  const hasPostselect = ops.some((op) => op.name === 'POSTSELECT')
+  const maxDepth = Math.max(MAX_ENUMERABLE_MEASUREMENTS + 1, branchLimit(n))
+  const acc = new Array<number>(dim).fill(0)
+  let work = 0
+  let leaves = 0
+
+  const spend = () => {
+    work += dim
+    if (work > workBudget) {
+      throw new BranchLimitError(MAX_BRANCHES, 'exact enumeration of this circuit is too much work; sample with execute() instead')
+    }
+  }
+
+  const walk = (state: StateVector, clbits: number[], probability: number, start: number, depth: number): void => {
+    for (let i = start; i < ops.length; i++) {
+      const op = ops[i]
+      if (op.condition) {
+        assertClbit(op.condition.bit, numClbits, 'condition bit')
+        if (clbits[op.condition.bit] !== op.condition.value) continue
+      }
+      const isMeasure = op.name === 'MEASURE' && op.clbit !== undefined
+      if (isMeasure || op.name === 'RESET') {
+        if (isMeasure) assertClbit(op.clbit as number, numClbits, 'classical bit')
+        const q = op.qubits[0]
+        const p1 = state.qubitProbability(q)
+        spend()
+        const outcomes: (0 | 1)[] = []
+        const weights: number[] = [0, 0]
+        for (const outcome of [0, 1] as const) {
+          const p = outcome === 1 ? p1 : 1 - p1
+          const weight = probability * p
+          if (weight <= BRANCH_EPSILON || !(p > COLLAPSE_EPSILON)) continue
+          outcomes.push(outcome)
+          weights[outcome] = weight
+        }
+        if (outcomes.length === 0) return
+        const settle = (s: StateVector, bits: number[], outcome: 0 | 1) => {
+          s.collapseQubit(q, outcome)
+          if (!isMeasure && outcome === 1) s.applySingle('X', q)
+          if (isMeasure) bits[op.clbit as number] = outcome
+        }
+        if (outcomes.length === 2) {
+          if (depth + 1 > maxDepth) {
+            throw new BranchLimitError(MAX_BRANCHES, 'circuit has too many nested measurement branches; sample with execute() instead')
+          }
+          spend()
+          const child = state.clone()
+          const childBits = clbits.slice()
+          settle(child, childBits, 0)
+          walk(child, childBits, weights[0], i + 1, depth + 1)
+          settle(state, clbits, 1)
+          probability = weights[1]
+        } else {
+          settle(state, clbits, outcomes[0])
+          probability = weights[outcomes[0]]
+        }
+        spend()
+        continue
+      }
+      if (op.name === 'POSTSELECT') {
+        const q = op.qubits[0]
+        const value = op.postselectValue as 0 | 1
+        const p1 = state.qubitProbability(q)
+        const p = value === 1 ? p1 : 1 - p1
+        if (p <= BRANCH_EPSILON || !(p > COLLAPSE_EPSILON)) return
+        state.collapseQubit(q, value)
+        probability *= p
+        spend()
+        continue
+      }
+      state.apply(op.condition ? { ...op, condition: undefined } : op)
+      spend()
+    }
+    if (++leaves > MAX_BRANCHES) throw new BranchLimitError(MAX_BRANCHES)
+    spend()
+    const p = state.normalize().probabilities()
+    for (let i = 0; i < dim; i++) acc[i] += probability * p[i]
+  }
+
+  const initial = new StateVector(n)
+  prepInitialStates(initial, circuit)
+  walk(initial, new Array<number>(numClbits).fill(0), 1, 0, 0)
+
+  if (hasPostselect) {
+    const total = acc.reduce((sum, v) => sum + v, 0)
+    if (!(total > BRANCH_EPSILON)) {
+      throw new Error(
+        'every postselection in this circuit is impossible from every branch (probability ~0); there is no conditional distribution to report'
+      )
+    }
+    for (let i = 0; i < dim; i++) acc[i] /= total
+  }
+  return acc
+}
+
+/**
  * A seed derived from the circuit's own contents.
  *
  * `simulate()` has to return one statevector for a circuit whose result is
@@ -1415,7 +1579,7 @@ function sampledProbabilities(circuit: Circuit, samples: number, rng: () => numb
  * suspiciously like it is always the same outcome. Randomness the learner is
  * meant to SEE comes from run(), which samples properly.
  */
-function circuitSeed(circuit: Circuit): number {
+export function circuitSeed(circuit: Circuit): number {
   let h = 0x811c9dc5
   const push = (n: number) => {
     h ^= n | 0
@@ -1548,6 +1712,14 @@ export interface RunResult {
   labels: string[]
   shots: number
   statevector: Complex[]
+  /**
+   * True when `probabilities` (and so the counts) are an ESTIMATE averaged over
+   * `trajectories` sampled runs, because the circuit has more mid-circuit
+   * measurement branching than can be enumerated exactly. Absent when exact.
+   */
+  approximate?: boolean
+  /** How many trajectories the estimate averaged. Present only with `approximate`. */
+  trajectories?: number
 }
 
 /**
@@ -1558,33 +1730,52 @@ export interface RunResult {
  * With classical control the distribution is NOT `simulate().probabilities()` —
  * that is one branch out of several, so sampling from it would report a
  * teleportation circuit as though its Bell measurement always came out the same
- * way. The exact mixture from outcomeBranches() is used instead, and
+ * way. The exact mixture over the measurement branches is used instead, and
  * `statevector` then carries the same single display trajectory `simulate()`
  * returns, which is a branch and not the mixture. It is here for the inspector,
  * not for arithmetic.
+ *
+ * Measurements that nothing reads or acts on afterwards (the usual "measure
+ * every qubit at the end") do not branch at all; see
+ * withoutTerminalMeasurements(). Only genuinely mid-circuit or fed-forward
+ * measurement is enumerated, and only when that is more than the enumeration
+ * bounds allow is the answer an estimate, which `approximate` then says.
  */
 export function run(circuit: Circuit, shots = 1024, noise = 0, seed?: number): RunResult {
   const sv = simulate(circuit)
   const rng = seed === undefined ? Math.random : mulberry32(seed)
   let probs: number[]
+  let approximate = false
+  let trajectories: number | undefined
   if (!hasClassicalControl(circuit)) {
     probs = sv.probabilities()
   } else {
-    let exact: number[] | null = null
-    if (recordedMeasurementCount(circuit) <= MAX_ENUMERABLE_MEASUREMENTS) {
-      try {
-        exact = outcomeProbabilities(circuit)
-      } catch (e) {
-        // RESET also forks, and the memory bound is lower at wide registers, so
-        // a circuit that looked enumerable by its measurement count can still
-        // outgrow the tree. Sample it; any other error is a real one.
-        if (!(e instanceof BranchLimitError)) throw e
+    const reduced = withoutTerminalMeasurements(circuit)
+    if (!hasClassicalControl(reduced)) {
+      probs = unitaryProbabilities(reduced)
+    } else {
+      let exact: number[] | null = null
+      if (recordedMeasurementCount(reduced) <= MAX_ENUMERABLE_MEASUREMENTS) {
+        try {
+          exact = exactOutcomeProbabilities(reduced)
+        } catch (e) {
+          // RESET also forks, and the work bound is finite, so a circuit that
+          // looked enumerable by its measurement count can still be out of
+          // reach. Sample it; any other error is a real one.
+          if (!(e instanceof BranchLimitError)) throw e
+        }
+      }
+      if (exact) {
+        probs = exact
+      } else {
+        // Too many branches to enumerate: estimate the mixture from trajectories
+        // instead. Approximate, and flagged so — but the shape of the answer is
+        // right, which sampling one branch would not be.
+        trajectories = sampleBudget(reduced, Math.max(256, shots))
+        probs = sampledProbabilities(reduced, trajectories, rng)
+        approximate = true
       }
     }
-    // Too many branches to enumerate: estimate the mixture from trajectories
-    // instead. Approximate — but the shape of the answer is right, which
-    // sampling one branch would not be.
-    probs = exact ?? sampledProbabilities(circuit, sampleBudget(circuit, Math.max(256, shots)), rng)
   }
   const labels = probs.map((_, i) => sv.label(i))
 
@@ -1612,7 +1803,12 @@ export function run(circuit: Circuit, shots = 1024, noise = 0, seed?: number): R
     counts[key] = (counts[key] ?? 0) + 1
   }
 
-  return { counts, probabilities: probs, labels, shots, statevector: sv.amplitudes() }
+  const result: RunResult = { counts, probabilities: probs, labels, shots, statevector: sv.amplitudes() }
+  if (approximate) {
+    result.approximate = true
+    result.trajectories = trajectories
+  }
+  return result
 }
 
 /** Deterministic PRNG so demos and tests are reproducible. */

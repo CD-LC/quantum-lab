@@ -69,4 +69,11 @@ describe('POST /api/circuits', () => {
     expect(statuses.filter((s) => s === 403)).toHaveLength(8 - MAX)
     expect(rows).toHaveLength(MAX)
   })
+
+  it('allows 30 saves a minute per account (sign-in migration) and rate limits the 31st', async () => {
+    const statuses: number[] = []
+    for (let i = 0; i < 31; i += 1) statuses.push((await POST(save())).status)
+    expect(statuses.slice(0, 30).every((s) => s !== 429)).toBe(true)
+    expect(statuses[30]).toBe(429)
+  })
 })

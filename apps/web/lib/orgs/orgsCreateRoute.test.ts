@@ -230,6 +230,31 @@ describe('POST /api/orgs: an org on a paid plan needs the caller’s own licence
     expect(db.orgs).toHaveLength(1)
   })
 
+  it('ignores an owned org that has no owner seat and repairs it instead of refusing (409)', async () => {
+    // A previous create inserted the org, then the owner-seat insert failed and
+    // RLS did not allow rolling the org back.
+    db.orgs = [
+      { id: 'org-orphan', name: 'Acme', slug: 'acme', plan_id: 'team', seats_total: 10, seats_used: 1, owner_id: TEAM, created_at: '2026-10-01T00:00:00.000Z' },
+    ]
+    const res = await route.POST(
+      post({ name: 'Acme', ownerId: TEAM, ownerEmail: 'lead@acme.test', planId: 'team' }, 't-team')
+    )
+    expect(res.status).toBe(201)
+    // No second organisation: the existing one got its seat.
+    expect(db.orgs).toHaveLength(1)
+    const seat = db.org_members.find((m) => m.org_id === 'org-orphan')
+    expect(seat).toMatchObject({ user_id: TEAM, role: 'owner', status: 'active', plan_id: 'team' })
+    const body = (await res.json()) as { org: { id: string } }
+    expect(body.org.id).toBe('org-orphan')
+
+    // Now it is a real, reachable org, so a further create is refused again.
+    const again = await route.POST(
+      post({ name: 'Acme 2', ownerId: TEAM, ownerEmail: 'lead@acme.test', planId: 'team' }, 't-team')
+    )
+    expect(again.status).toBe(409)
+    expect(db.orgs).toHaveLength(1)
+  })
+
   it('accepts past_due as still in good standing', async () => {
     db.subscriptions = [{ user_id: TEAM, plan_id: 'team', status: 'past_due' }]
     const res = await route.POST(

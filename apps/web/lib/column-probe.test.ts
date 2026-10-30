@@ -78,3 +78,37 @@ describe('describeColumnProbe / formatProbePct', () => {
     expect(past).toMatch(/^After the last gate/)
   })
 })
+
+describe('columnProbeReadout with truncated frames', () => {
+  // 20 H gates on q0 and an X on q1 at the end: q1 reads 1 only after the last gate.
+  const ops = Array.from({ length: 20 }, () => ({ name: 'H' as const, qubits: [0] }))
+  ops.push({ name: 'X' as never, qubits: [1] })
+  const circuit: Circuit = { numQubits: 2, ops }
+  const all = simulateSteps(circuit)
+  const kept = all.slice(0, 6) // the frames a long circuit on a wide register would keep
+  const finalState = all[all.length - 1]
+  const context = { opCount: circuit.ops.length, finalState }
+
+  it('reads nothing for a column whose frame was cut off', () => {
+    expect(columnProbeReadout(kept, 4, context)).not.toBeNull()
+    expect(columnProbeReadout(kept, 5, context)).toBeNull()
+    expect(columnProbeReadout(kept, 19, context)).toBeNull()
+  })
+
+  it('reads the exact final state past the last gate, not the last kept frame', () => {
+    const past = columnProbeReadout(kept, 21, context)!
+    expect(past.pastEnd).toBe(true)
+    expect(past.p1s[1]).toBeCloseTo(1, 12)
+    // The old behaviour clamped to the last kept frame, where q1 is still 0.
+    expect(columnProbeReadout(kept, 21)!.p1s[1]).toBeCloseTo(0, 12)
+    // The final gate's own column is the last column with a gate: its frame is cut too.
+    expect(columnProbeReadout(kept, 20, context)).toBeNull()
+  })
+
+  it('is unchanged when every frame was kept', () => {
+    const full = columnProbeReadout(all, 20, context)!
+    expect(full.pastEnd).toBe(false)
+    expect(full.p1s[1]).toBeCloseTo(1, 12)
+    expect(columnProbeReadout(all, 25, context)!.p1s[1]).toBeCloseTo(1, 12)
+  })
+})

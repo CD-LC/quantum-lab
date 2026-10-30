@@ -46,6 +46,7 @@
  */
 
 import {
+  circuitSeed,
   execute,
   fromQasm,
   hasClassicalControl,
@@ -318,25 +319,6 @@ function sparseAmplitudes(sv: StateVector): { entries: AmplitudeEntry[]; omitted
 }
 
 /**
- * A seed derived from the whole circuit, so every step of one circuit replays
- * the same measurement outcomes: `execute` draws from the rng in op order, so
- * running a prefix with the same seed reproduces exactly the frame the full
- * run would have passed through. FNV-1a over the ops; mirrors the private
- * `circuitSeed` in lib/quantum.ts in purpose, not necessarily in value.
- */
-function stepSeed(circuit: Circuit): number {
-  let h = 0x811c9dc5
-  const push = (n: number) => {
-    h ^= n | 0
-    h = Math.imul(h, 0x01000193)
-  }
-  push(circuit.numQubits)
-  const text = JSON.stringify([circuit.initialStates ?? null, circuit.ops])
-  for (let i = 0; i < text.length; i++) push(text.charCodeAt(i))
-  return h >>> 0
-}
-
-/**
  * The state after the first `step` ops, computed with ONE statevector.
  *
  * `simulateSteps` clones the vector after every gate and returns all frames —
@@ -348,7 +330,14 @@ function stepSeed(circuit: Circuit): number {
 function stateAfterStep(circuit: Circuit, step: number): StateVector {
   const prefix: Circuit = { ...circuit, ops: circuit.ops.slice(0, step) }
   if (hasClassicalControl(circuit)) {
-    return execute(prefix, { rng: mulberry32(stepSeed(circuit)) }).state.normalize()
+    // The seed comes from the WHOLE circuit and is the one simulate(),
+    // simulateSteps() and run() use, and execute() draws in op order, so step N
+    // is a prefix of the same trajectory those report (and the same state the
+    // simulator's step inspector shows), not a second, unrelated one.
+    return execute(prefix, {
+      rng: mulberry32(circuitSeed(circuit)),
+      tolerateImpossiblePostselect: true,
+    }).state.normalize()
   }
   return simulate(prefix)
 }
@@ -418,6 +407,19 @@ const runCircuit: McpToolDef = {
       counts: result.counts,
       statevector: sparse,
       omittedNearZeroAmplitudes: omitted,
+      // Only present when the circuit measures mid-circuit more than can be
+      // enumerated exactly: the counts are then drawn from an estimate. A
+      // circuit that measures only at the end is always exact.
+      ...(result.approximate
+        ? {
+            approximate: true,
+            trajectories: result.trajectories,
+            approximationNote:
+              'Counts are sampled from a distribution estimated over ' +
+              `${result.trajectories} trajectories; this circuit has too much mid-circuit ` +
+              'measurement to enumerate exactly.',
+          }
+        : {}),
       conventions:
         'Bitstring labels are MSB-first (qubit 0 is the rightmost character), matching Qiskit.',
     })

@@ -25,18 +25,19 @@ export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
 /**
- * Deliberately low: the limit check below is count-then-insert, and the
- * rate limit is what narrows the window a burst of concurrent saves has.
- * A person saving by hand never gets near ten a minute.
+ * 30 saves a minute. A person saving by hand never gets near it, but the
+ * sign-in migration of locally saved circuits (lib/circuit-store.ts) posts them
+ * back to back, and a lower ceiling stalls it. The count-then-insert race is
+ * closed by the per-account serialisation below, not by this limit.
  */
-const SAVE_LIMIT = { limit: 10, windowMs: 60_000 }
+const SAVE_LIMIT = { limit: 30, windowMs: 60_000 }
 
 /**
  * Per-account serialisation of the count-then-insert section, within this
  * process. Without it ~N concurrent POSTs from one Free account all read the
  * same count and all insert. This does not span instances: the cross-instance
  * guarantee needs a database-side atomic insert (see the deferred migration
- * note in the audit), so the lowered SAVE_LIMIT remains the backstop.
+ * note in the audit), so SAVE_LIMIT remains the backstop there.
  */
 const saveChains = new Map<string, Promise<unknown>>()
 

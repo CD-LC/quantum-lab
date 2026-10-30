@@ -137,6 +137,11 @@ export class CircuitLimitError extends Error {
   }
 }
 
+/** Longest single wait when the server asks the migration to slow down. */
+const MIGRATE_MAX_WAIT_MS = 65_000
+/** How many consecutive 429 waits one circuit gets before the migration gives up. */
+const MIGRATE_MAX_RATE_LIMIT_WAITS = 6
+
 /**
  * Insert one circuit into the signed-in account, through POST /api/circuits.
  *
@@ -146,12 +151,16 @@ export class CircuitLimitError extends Error {
  * limit, and returns null on any other failure so callers can keep the
  * circuit locally instead of losing it.
  */
-async function insertRemote(fields: {
-  name: string
-  description: string | null
-  qasm: string
-  numQubits: number
-}): Promise<SavedCircuitRow | null> {
+async function insertRemote(
+  fields: {
+    name: string
+    description: string | null
+    qasm: string
+    numQubits: number
+  },
+  /** Filled in with the server's retry-after (ms) when the save was rate limited (429). */
+  outcome?: { retryAfterMs?: number }
+): Promise<SavedCircuitRow | null> {
   let response: Response
   try {
     response = await authFetch('/api/circuits', {
@@ -161,6 +170,13 @@ async function insertRemote(fields: {
     })
   } catch {
     return null
+  }
+  if (response.status === 429 && outcome) {
+    const seconds = Number(response.headers.get('retry-after'))
+    outcome.retryAfterMs = Math.min(
+      MIGRATE_MAX_WAIT_MS,
+      Math.max(1_000, (Number.isFinite(seconds) && seconds > 0 ? seconds : 5) * 1_000)
+    )
   }
   const body: unknown = await response.json().catch(() => null)
   const record = typeof body === 'object' && body !== null ? (body as Record<string, unknown>) : {}
@@ -398,12 +414,23 @@ async function doMigrate(userId: string): Promise<number> {
       continue
     }
     try {
-      const row = await insertRemote({
-        name: item.name,
-        description: item.description ?? null,
-        qasm: item.qasm,
-        numQubits: item.numQubits,
-      })
+      let row: SavedCircuitRow | null = null
+      // A 429 is not a failure: wait for the window the server named and try
+      // this same circuit again, so a long local list still migrates in full.
+      for (let waits = 0; ; waits += 1) {
+        const outcome: { retryAfterMs?: number } = {}
+        row = await insertRemote(
+          {
+            name: item.name,
+            description: item.description ?? null,
+            qasm: item.qasm,
+            numQubits: item.numQubits,
+          },
+          outcome
+        )
+        if (row || outcome.retryAfterMs === undefined || waits >= MIGRATE_MAX_RATE_LIMIT_WAITS) break
+        await new Promise<void>((resolve) => setTimeout(resolve, outcome.retryAfterMs))
+      }
       if (!row) break
       moved.add(item.id)
     } catch {

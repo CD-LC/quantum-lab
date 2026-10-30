@@ -172,11 +172,15 @@ ARG NEXT_PUBLIC_DEVICE_TUTOR=""
 #   - NEXT_PUBLIC_SENTRY_RELEASE: read by lib/observability/release.ts (Sentry
 #     release, /api/health `version`). Inlined at build, so it reaches both the
 #     server and the browser bundle.
-#   - NEXT_PUBLIC_BUILD_STAMP: next.config.mjs uses it as the build id and the
-#     service-worker cache name, so rebuilding the same commit does not evict
-#     every installed user's cache. next.config.mjs sanitises and truncates it.
-# Not secrets (a commit SHA of a public repo). Empty default: a local build
-# with no value falls back to 'unknown' / a timestamp exactly as before.
+#   - NEXT_PUBLIC_BUILD_STAMP: next.config.mjs uses it as BOTH the Next build id
+#     and the service-worker cache name (sw.js?v=<stamp>), so rebuilding the
+#     same commit does not evict every installed user's cache. next.config.mjs
+#     sanitises and truncates it, and treats an EMPTY value as unset: an image
+#     built with no build-arg (this ARG's "" default is exported below as an
+#     empty ENV) falls back through VERCEL_GIT_COMMIT_SHA, GITHUB_SHA and then a
+#     build timestamp, so the build id and the cache name always rotate.
+# Not secrets (a commit SHA of a public repo). Pass it where you can for a
+# stable, commit-derived id: --build-arg NEXT_PUBLIC_BUILD_STAMP=$(git rev-parse HEAD)
 ARG NEXT_PUBLIC_SENTRY_RELEASE=""
 ARG NEXT_PUBLIC_BUILD_STAMP=""
 # deploy.yml and deploy.sh already pass this as a build arg; without an ARG here

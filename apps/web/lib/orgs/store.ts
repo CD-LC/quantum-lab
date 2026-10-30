@@ -524,6 +524,49 @@ export function planCanOwnSeats(planId: PlanId): planId is 'team' | 'edu' {
   return planId === 'team' || planId === 'edu'
 }
 
+/** The creator's owner seat, in the shape every create path writes it. */
+function insertOwnerSeat(supabase: SupabaseClient, org: Org, ownerId: string, email: string) {
+  return supabase.from('org_members').insert({
+    org_id: org.id,
+    user_id: ownerId,
+    email,
+    role: 'owner',
+    status: 'active',
+    plan_id: org.planId,
+  })
+}
+
+/**
+ * An org the caller owns on `planId` that has no owner seat: the leftover of a
+ * create whose second statement failed. Null when there is none, and also when
+ * the lookup itself fails (the normal insert then proceeds as before).
+ */
+async function findOwnerlessOrg(
+  supabase: SupabaseClient,
+  ownerId: string,
+  planId: PlanId
+): Promise<Org | null> {
+  try {
+    const { data: owned, error } = await supabase
+      .from('orgs')
+      .select('*')
+      .eq('owner_id', ownerId)
+      .eq('plan_id', planId)
+    if (error || !Array.isArray(owned) || owned.length === 0) return null
+    const { data: seats, error: seatError } = await supabase
+      .from('org_members')
+      .select('org_id')
+      .eq('user_id', ownerId)
+      .eq('role', 'owner')
+    if (seatError || !Array.isArray(seats)) return null
+    const seated = new Set((seats as { org_id?: unknown }[]).map((row) => row.org_id))
+    const orphan = (owned as OrgRow[]).find((row) => !seated.has(row.id))
+    return orphan ? rowToOrg(orphan) : null
+  } catch {
+    return null
+  }
+}
+
 export async function createOrg(input: CreateOrgInput, ctx?: OrgContext): Promise<Org> {
   const now = new Date().toISOString()
   const seatsTotal = PLAN_BY_ID[input.planId]?.limits.seats ?? 1
@@ -543,6 +586,20 @@ export async function createOrg(input: CreateOrgInput, ctx?: OrgContext): Promis
     }
     const ownerId = ctx ? (backend.userId as string) : input.ownerId
     try {
+      // A previous create may have inserted the org and then failed to seat its
+      // owner. RLS gives non-service callers no delete on `orgs`, so that row
+      // cannot be rolled back; it would otherwise block a retry (one org per
+      // plan) and leave the payer locked out of their own organisation. Repair
+      // it by adding the missing owner seat instead of creating a second org.
+      const orphan = await findOwnerlessOrg(supabase, ownerId, input.planId)
+      if (orphan) {
+        const repaired = await insertOwnerSeat(supabase, orphan, ownerId, input.ownerEmail)
+        if (repaired?.error) {
+          throw new Error(repaired.error.message ?? 'Could not create the owner seat.')
+        }
+        return orphan
+      }
+
       const { data, error } = await supabase
         .from('orgs')
         .insert({
@@ -558,19 +615,12 @@ export async function createOrg(input: CreateOrgInput, ctx?: OrgContext): Promis
       if (!error && data) {
         const org = rowToOrg(data as OrgRow)
         // The creator always takes the first seat as owner.
-        const seat = await supabase.from('org_members').insert({
-          org_id: org.id,
-          user_id: ownerId,
-          email: input.ownerEmail,
-          role: 'owner',
-          status: 'active',
-          plan_id: input.planId,
-        })
+        const seat = await insertOwnerSeat(supabase, org, ownerId, input.ownerEmail)
         if (seat?.error) {
-          // An org with no owner seat is unreachable by everyone, including its
-          // creator, and still counts as "created". Take it back out and fail,
-          // so the caller can retry instead of being told it worked.
-          await supabase.from('orgs').delete().eq('id', org.id)
+          // Fail so the caller is not told it worked. The org row is NOT
+          // deleted: RLS gives non-service callers no delete on `orgs`, so a
+          // rollback would silently do nothing. The retry finds this ownerless
+          // org (findOwnerlessOrg) and seats the owner instead.
           throw new Error(seat.error.message ?? 'Could not create the owner seat.')
         }
         return org

@@ -265,7 +265,23 @@ export interface DispatchReport {
    * operator's problem and never a duplicate send.
    */
   failures: { subscriptionId: string; day: number; reason: string; released?: boolean }[]
+  /**
+   * Listed subscriptions this pass did NOT start because the wall-clock budget
+   * (DISPATCH_BUDGET_MS) was spent. Nothing was claimed for them; the next
+   * pass picks them up. Zero on a pass that finished the whole batch.
+   */
+  remaining: number
 }
+
+/**
+ * Wall-clock budget for one pass. The cron's curl gives up at 90 s and
+ * Cloudflare at about 100 s, while 100 paced sends alone take ~50 s plus the
+ * provider's latency and retries. Once this much time has passed no NEW send is
+ * started; a send already in flight finishes. Nothing is lost by stopping
+ * early: the stopped-on rows were never claimed, so the next hourly pass (or
+ * the immediate retry) sends them.
+ */
+export const DISPATCH_BUDGET_MS = 60_000
 
 /** Gap between provider calls: Resend's default limit is about 2 requests a second. */
 export const SEND_PACE_MS = 500
@@ -287,18 +303,39 @@ export async function runCourseDispatch(input: {
   send?: SendFn
   /** Injectable for tests; defaults to a real timer. */
   sleep?: (ms: number) => Promise<void>
+  /** Wall-clock budget in ms before no new send is started. Defaults to DISPATCH_BUDGET_MS. */
+  budgetMs?: number
+  /** Injectable epoch-ms clock for the budget; defaults to Date.now. */
+  clock?: () => number
 }): Promise<DispatchReport> {
   const now = input.now ?? new Date()
   const store = input.store ?? supabaseDispatchStore
   const send = input.send ?? sendEmail
   const base = input.baseUrl.replace(/\/+$/, '')
   const sleep = input.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
+  const clock = input.clock ?? Date.now
+  const budgetMs = input.budgetMs ?? DISPATCH_BUDGET_MS
+  const startedAt = clock()
   let sentSomething = false
 
-  const report: DispatchReport = { examined: 0, sent: 0, notDue: 0, lostClaims: 0, failures: [] }
+  const report: DispatchReport = {
+    examined: 0,
+    sent: 0,
+    notDue: 0,
+    lostClaims: 0,
+    failures: [],
+    remaining: 0,
+  }
   const candidates = await store.listCandidates(input.limit, now)
 
-  for (const candidate of candidates) {
+  for (let index = 0; index < candidates.length; index += 1) {
+    const candidate = candidates[index]
+    // Checked BEFORE the claim, never between a claim and its send: a claimed
+    // day must always reach the provider in this same iteration.
+    if (clock() - startedAt >= budgetMs) {
+      report.remaining = candidates.length - index
+      break
+    }
     report.examined += 1
     const day = dueCourseDay(candidate, now)
     if (day === null) {

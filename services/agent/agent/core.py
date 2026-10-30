@@ -25,6 +25,8 @@ __all__ = [
     "debug_loop_guidance",
     "run_paper_guidance",
     "SETUP_MESSAGE",
+    "AgentStoppedError",
+    "is_force_stop_output",
 ]
 
 SETUP_MESSAGE: str = (
@@ -352,6 +354,33 @@ def build_agent(
     )
 
 
+class AgentStoppedError(Exception):
+    """The executor hit its round or wall-clock limit and produced no answer.
+
+    Deliberately not a ``RuntimeError``: the server reads that as "not
+    configured" and answers 200 with setup text. This is a failed run, so it
+    surfaces as the 502 ``provider_error`` the web app already falls back on.
+    """
+
+
+#: LangChain's ``early_stopping_method="force"`` output when a run is cut off
+#: by ``max_iterations`` or ``max_execution_time``. It arrives as an ordinary
+#: ``output`` string, indistinguishable from an answer unless matched here.
+_FORCE_STOP_MARKER = "agent stopped due to iteration limit or time limit"
+
+
+def is_force_stop_output(output: str) -> bool:
+    """Whether an executor output is its force-stop sentinel, not an answer.
+
+    Args:
+        output: The executor's final output text.
+
+    Returns:
+        True when the text is the "stopped due to iteration or time limit" message.
+    """
+    return output.strip().lower().startswith(_FORCE_STOP_MARKER)
+
+
 def ask(
     question: str,
     level: str = "beginner",
@@ -377,6 +406,8 @@ def ask(
     Raises:
         RuntimeError: If the service is not configured (no API key or missing
             LangChain dependencies).
+        AgentStoppedError: If the run hit its round or time limit and so has no
+            real answer to return.
     """
     executor = build_agent(
         level=level,
@@ -419,4 +450,8 @@ def ask(
             block.get("text", "") if isinstance(block, dict) else str(block) for block in output
         )
 
-    return {"reply": str(output).strip(), "tools_used": tools_used}
+    reply = str(output).strip()
+    if is_force_stop_output(reply):
+        raise AgentStoppedError("agent run stopped at its iteration or time limit")
+
+    return {"reply": reply, "tools_used": tools_used}

@@ -101,6 +101,50 @@ describe('get_statevector_at_step memory', () => {
   })
 })
 
+describe('get_statevector_at_step follows the run_circuit trajectory', () => {
+  type Sparse = { state: string; re: number; im: number }[]
+  const qasm = [
+    'OPENQASM 3.0;',
+    'include "stdgates.inc";',
+    'qubit[3] q;',
+    'bit[3] c;',
+    'h q[0];',
+    'h q[1];',
+    'h q[2];',
+    'c[0] = measure q[0];',
+    'c[1] = measure q[1];',
+    'c[2] = measure q[2];',
+  ].join('\n')
+
+  it('the last step equals the statevector run_circuit reports for a measured circuit', async () => {
+    const ran = await callToolAsync('run_circuit', { qasm, shots: 8, seed: 1 })
+    const last = await callToolAsync('get_statevector_at_step', { qasm, step: 6 })
+    expect(ran.isError).toBeUndefined()
+    expect(last.isError).toBeUndefined()
+    // run_circuit lists states by their probability in the measurement mixture;
+    // the amplitudes are the one trajectory, so compare the ones that are set.
+    const live = (e: Sparse[number]) => Math.hypot(e.re, e.im) > 1e-9
+    const a = (ran.structuredContent as { statevector: Sparse }).statevector.filter(live)
+    const b = (last.structuredContent as { statevector: Sparse }).statevector.filter(live)
+    expect(a).toHaveLength(1) // a collapsed trajectory: one basis state
+    expect(b.map((e) => e.state)).toEqual(a.map((e) => e.state))
+  })
+
+  it('every step is a prefix of that one trajectory (step 6 is not a fresh draw)', async () => {
+    const final = await callToolAsync('get_statevector_at_step', { qasm, step: 6 })
+    const finalState = (final.structuredContent as { statevector: Sparse }).statevector[0].state
+    // After measuring qubit k the state is collapsed on that qubit; the bit it
+    // collapsed to must still be there at every later step.
+    for (const [step, qubit] of [[4, 0], [5, 1]] as const) {
+      const out = await callToolAsync('get_statevector_at_step', { qasm, step })
+      const entries = (out.structuredContent as { statevector: Sparse }).statevector
+      for (const e of entries) {
+        expect(e.state[e.state.length - 1 - qubit]).toBe(finalState[finalState.length - 1 - qubit])
+      }
+    }
+  })
+})
+
 describe('generate_verified_circuit quota', () => {
   beforeEach(() => {
     gate.calls.length = 0

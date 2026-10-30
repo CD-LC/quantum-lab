@@ -187,6 +187,7 @@ export default function CircuitGrid({
   onChange,
   activeStep = null,
   frames,
+  finalState,
   classicalControl = true,
 }: {
   circuit: Circuit
@@ -211,6 +212,13 @@ export default function CircuitGrid({
    * style. Optional so other embedders of the grid pay nothing for it.
    */
   frames?: StateVector[]
+  /**
+   * The exact state after the last gate. A long circuit on a wide register
+   * keeps only a prefix of `frames`; with this, a column past the last gate
+   * still reads the true final state, and a column whose frame was cut off
+   * reads nothing instead of an earlier state mislabelled as that column's.
+   */
+  finalState?: StateVector
 }) {
   const [pending, setPending] = useState<number[]>([])
   /**
@@ -802,8 +810,11 @@ export default function CircuitGrid({
     hoveredCol ?? hovered ?? (gridFocused ? cursorCol : null)
   const probeReadout = useMemo(() => {
     if (!frames || probeCol === null) return null
-    return columnProbeReadout(frames, Math.min(probeCol, numCols - 1))
-  }, [frames, probeCol, numCols])
+    return columnProbeReadout(frames, Math.min(probeCol, numCols - 1), {
+      opCount: circuit.ops.length,
+      finalState,
+    })
+  }, [frames, finalState, probeCol, numCols, circuit.ops.length])
 
   /**
    * A register block or a 2-qubit custom matrix draws ONE wide box spanning
@@ -841,8 +852,15 @@ export default function CircuitGrid({
     }
     if (lastSpokenColRef.current === cursorCol) return
     lastSpokenColRef.current = cursorCol
-    const readout = columnProbeReadout(frames, cursorCol)
+    const readout = columnProbeReadout(frames, cursorCol, {
+      opCount: circuit.ops.length,
+      finalState,
+    })
     if (readout) announce(describeColumnProbe(readout))
+    // circuit.ops.length and finalState are read for the lookup only; a new
+    // circuit must not re-announce the same column, which is what keying on
+    // cursorCol and frames (both rebuilt with the circuit) already guarantees.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cursorCol, frames, gridFocused])
 
   return (

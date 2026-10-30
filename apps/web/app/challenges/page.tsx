@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import ChallengeCard from '@/components/challenge/ChallengeCard'
 import { Segmented } from '@/components/ui/Controls'
@@ -50,7 +50,16 @@ export default function ChallengesPage() {
     setProgress(readProgress())
   }, [])
 
-  const daily = useMemo(() => CHALLENGES[dailyIndex(new Date(), CHALLENGES.length)], [])
+  // The pick depends on the clock, and this page is prerendered at build time:
+  // computing it during render made the server's HTML (the build day's puzzle)
+  // disagree with the browser's (today's) after the next UTC midnight, which
+  // React reports as hydration error #418. Choose after mount instead, like
+  // the localStorage read above; until then a neutral placeholder is rendered
+  // by both sides.
+  const [daily, setDaily] = useState<(typeof CHALLENGES)[number] | null>(null)
+  useEffect(() => {
+    setDaily(CHALLENGES[dailyIndex(new Date(), CHALLENGES.length)])
+  }, [])
 
   const solvedCount = CHALLENGES.filter((ch) => progress[ch.id]?.solved).length
   const total = CHALLENGES.length
@@ -110,14 +119,20 @@ export default function ChallengesPage() {
           <span className="section-label text-q-amber-text">
             Daily challenge
           </span>
-          <h2 className="mt-2 text-lg font-bold text-ink">{daily.title}</h2>
-          <p className="mt-1.5 max-w-2xl text-[13px] text-ink-secondary">{daily.brief}</p>
+          <h2 className="mt-2 text-lg font-bold text-ink">{daily ? daily.title : 'Today\u2019s puzzle'}</h2>
+          <p className="mt-1.5 max-w-2xl text-[13px] text-ink-secondary">
+            {daily ? daily.brief : 'Picking today\u2019s puzzle\u2026'}
+          </p>
           <p className="mt-2 text-[11px] text-ink-muted">
             Picked from today&rsquo;s UTC date, so everyone gets the same puzzle today.
           </p>
         </div>
-        <Link href={`/challenges/${daily.id}`} className="btn-primary focus-ring shrink-0">
-          {progress[daily.id]?.solved ? 'Solve it again' : 'Take it on'}
+        <Link
+          href={daily ? `/challenges/${daily.id}` : '/challenges'}
+          aria-disabled={daily ? undefined : true}
+          className="btn-primary focus-ring shrink-0"
+        >
+          {daily && progress[daily.id]?.solved ? 'Solve it again' : 'Take it on'}
         </Link>
       </section>
 

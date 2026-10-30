@@ -104,9 +104,11 @@ test.describe('pricing', () => {
     await expect(upgrade).toBeVisible()
     await upgrade.click()
 
-    const notice = page.getByText(/billing is not (set up|configured)/i).first()
+    // Customer-facing wording: the operator instructions (which env vars to
+    // set) travel in the API's `hint` field and are never rendered.
+    const notice = page.getByText(/paid plans are not open|not available for purchase/i).first()
     await expect(notice).toBeVisible()
-    await expect(notice).toContainText(/environment/i)
+    await expect(notice).not.toContainText(/STRIPE_|environment|docs\/BILLING/i)
 
     // Still on /pricing — no half-built checkout redirect.
     await expect(page).toHaveURL(before)

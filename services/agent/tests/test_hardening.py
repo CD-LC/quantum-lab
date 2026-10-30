@@ -243,3 +243,39 @@ def test_chat_forwards_the_learner_plan(monkeypatch: pytest.MonkeyPatch) -> None
     assert client.post("/api/agent/chat", json={"message": "hi", "learner_plan": "p"}).status_code == 200
     assert seen["learner_plan"] == "p"
     assert client.post("/api/agent/chat", json={"message": "hi", "learner_plan": "x" * 3000}).status_code == 422
+
+
+def test_agent_time_budget_leaves_the_web_fallback_room() -> None:
+    assert settings.max_agent_seconds <= 22
+
+
+class _StoppedExecutor:
+    def __init__(self, output: str) -> None:
+        self._output = output
+
+    def invoke(self, _inputs: dict[str, Any]) -> dict[str, Any]:
+        return {"output": self._output, "intermediate_steps": []}
+
+
+def test_ask_raises_when_the_executor_force_stops(monkeypatch: pytest.MonkeyPatch) -> None:
+    sentinel = "Agent stopped due to iteration limit or time limit."
+    monkeypatch.setattr(core, "build_agent", lambda **_kw: _StoppedExecutor(sentinel))
+    with pytest.raises(core.AgentStoppedError):
+        core.ask("hello")
+
+
+def test_ask_returns_a_normal_reply(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(core, "build_agent", lambda **_kw: _StoppedExecutor(" Hello there. "))
+    assert core.ask("hello") == {"reply": "Hello there.", "tools_used": []}
+
+
+def test_chat_maps_a_force_stopped_run_to_502(monkeypatch: pytest.MonkeyPatch) -> None:
+    from fastapi.testclient import TestClient
+
+    from agent import server
+
+    sentinel = "Agent stopped due to iteration limit or time limit."
+    monkeypatch.setattr(core, "build_agent", lambda **_kw: _StoppedExecutor(sentinel))
+    response = TestClient(server.app).post("/api/agent/chat", json={"message": "hi"})
+    assert response.status_code == 502
+    assert response.json()["detail"]["error"] == "provider_error"

@@ -1029,3 +1029,26 @@ user to re-enter their credential after the change; (4) keep the previous key in
 the secret manager until that has happened. The admin-set provider keys in
 `platform_settings` follow the same rule and must be re-entered in
 `/admin/platform`.
+
+## 2026-10-30 follow-up review
+
+An independent review of the audit commit found and fixed: exact measure-all
+results at 11–16 qubits (the new work budgets had silently turned them into
+estimates), a stale step scrubber when frames are capped, the tutor treating
+LangChain's force-stop sentence as an answer, QASM 2 gate towers and QASM 3
+for-loops slipping past the operation ceiling, an empty build stamp freezing the
+service-worker cache name, and a daily-challenge hydration mismatch on
+`/challenges` that appeared after every UTC midnight following a deploy.
+
+Known and deferred:
+
+- `npm audit --omit=dev` reports four low-severity advisories that arrive through
+  `resend` → `@react-email/render` → `html-to-text` → `deepmerge` (prototype
+  poisoning in `mergeObject`). The code path converts our own email templates,
+  not attacker input. The fix is a major bump of `resend` (4 → 6) on the code that
+  sends real mail; do it on its own branch with a live send test.
+- A Free user who re-subscribes on a cancelled row now depends on the Stripe
+  webhook or the post-checkout reconcile on `/account`; the entitlement route no
+  longer re-queries Stripe for cancelled rows.
+- `/api/workbench/evolve` charges one daily model-quota unit per proposal call,
+  so a long run with several providers can exhaust the Free allowance.

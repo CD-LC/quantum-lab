@@ -231,8 +231,23 @@ export async function ownsOrgOnPlan(
       .select('id')
       .eq('owner_id', ctx.userId)
       .eq('plan_id', planId)
-    if (error || !Array.isArray(data)) return false
-    return data.length > 0
+    if (error || !Array.isArray(data) || data.length === 0) return false
+
+    // An owned org with NO owner seat is a half-finished create (the seat
+    // insert failed after the org row landed, and RLS does not let the caller
+    // delete the row). It is unreachable to everyone, so it is not "an
+    // organisation they already own": ignoring it lets the retry through, and
+    // createOrg repairs it by inserting the missing seat.
+    const { data: seats, error: seatError } = await ctx.client
+      .from('org_members')
+      .select('org_id')
+      .eq('user_id', ctx.userId)
+      .eq('role', 'owner')
+    if (seatError || !Array.isArray(seats)) return false
+    const seated = new Set(
+      (seats as { org_id?: unknown }[]).map((row) => row.org_id).filter((id) => typeof id === 'string')
+    )
+    return (data as { id?: unknown }[]).some((row) => typeof row.id === 'string' && seated.has(row.id))
   } catch {
     return false
   }

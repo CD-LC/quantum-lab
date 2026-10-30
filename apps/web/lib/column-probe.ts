@@ -33,16 +33,49 @@ export interface ColumnProbeReadout {
 }
 
 /**
+ * What the caller knows about the circuit behind `frames`. Optional, so a
+ * caller with complete frames (or a test) can pass nothing.
+ */
+export interface ColumnProbeContext {
+  /**
+   * circuit.ops.length. Needed to tell "past the last gate" (the final state)
+   * from "a real column whose frame was cut off" when simulateSteps() kept only
+   * a prefix of the frames for a long circuit on a wide register.
+   */
+  opCount?: number
+  /** The exact state after the last op, kept even when the frames are cut off. */
+  finalState?: StateVector
+}
+
+/**
  * Read the per-qubit |1⟩ probabilities after column `col` out of the step
  * frames. Returns null for an empty frames array (a render race guard — the
- * caller shows nothing rather than a wrong number).
+ * caller shows nothing rather than a wrong number), and, when `opCount` is
+ * given, for a column that has a gate but no kept frame: the frames are a
+ * prefix of a long circuit, and reading the last kept one would label an earlier
+ * state "after column N".
  */
 export function columnProbeReadout(
   frames: StateVector[],
-  col: number
+  col: number,
+  context: ColumnProbeContext = {}
 ): ColumnProbeReadout | null {
   if (frames.length === 0) return null
   const safeCol = Math.max(0, Math.floor(col))
+  const { opCount, finalState } = context
+  if (opCount !== undefined && safeCol >= opCount) {
+    // Past the last gate: the final state, which is exact even when the frames
+    // are not complete.
+    const state = finalState ?? (frames.length - 1 >= opCount ? frames[opCount] : undefined)
+    if (!state) return null
+    return {
+      col: safeCol,
+      frameIndex: Math.min(opCount, frames.length - 1),
+      pastEnd: true,
+      p1s: allQubitPhaseInfo(state).map((info) => info.p1),
+    }
+  }
+  if (opCount !== undefined && safeCol + 1 > frames.length - 1) return null
   const frameIndex = Math.min(safeCol + 1, frames.length - 1)
   return {
     col: safeCol,

@@ -48,6 +48,28 @@ MAX_QASM_CHARS = 131_072
 _QASM2_REGISTER = re.compile(r"\b[qc]reg\s+\w+\s*\[([^\]]*)\]", re.IGNORECASE)
 _QASM3_REGISTER = re.compile(r"\b(?:qubit|bit)\s*\[([^\]]*)\]", re.IGNORECASE)
 _PLAIN_DECIMAL = re.compile(r"\d{1,12}")
+_QASM_COMMENT = re.compile(r"//[^\n]*|/\*.*?(?:\*/|\Z)", re.DOTALL)
+
+
+def _is_numeric_size(size: str) -> bool:
+    """Whether a register-size bracket body is a plain numeric expression.
+
+    Args:
+        size: The text between the brackets, already stripped.
+
+    Returns:
+        True for literals and arithmetic on them (``12``, ``4_000_000``,
+        ``0x186A0``, ``50000*2``); False for empty text or anything naming an
+        identifier.
+    """
+    if not size:
+        return False
+    # Hex digits look like identifiers once the 0x prefix is split off, so test
+    # each whitespace/operator-separated token whole.
+    for token in re.split(r"[\s()+\-*/%]+", size):
+        if token and not re.fullmatch(r"\d[\w.]*", token):
+            return False
+    return True
 
 
 def guard_qasm(qasm: str, max_qubits: int | None = None) -> None:
@@ -75,9 +97,16 @@ def guard_qasm(qasm: str, max_qubits: int | None = None) -> None:
         )
 
     limit = settings.max_qubits if max_qubits is None else min(max_qubits, settings.max_qubits)
+    # Comments are not code: "// the qubit[ register" must not be read as one.
+    code = _QASM_COMMENT.sub(" ", qasm)
     for pattern in (_QASM2_REGISTER, _QASM3_REGISTER):
-        for match in pattern.finditer(qasm):
+        for match in pattern.finditer(code):
             size = match.group(1).strip()
+            if not _is_numeric_size(size):
+                # A named constant, an empty bracket or anything else that is
+                # not a literal expression: the parser resolves it and
+                # MAX_PARSED_QUBITS refuses it afterwards if it is too wide.
+                continue
             # A plain decimal is compared exactly. Anything else (a very long
             # digit run, underscores, hex/octal/binary, an expression, a
             # constant name) cannot be evaluated cheaply here, so it is over

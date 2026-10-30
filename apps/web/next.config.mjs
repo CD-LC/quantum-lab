@@ -24,16 +24,28 @@
  * stamp that no longer tracks the build id is worse than the hard-coded 'v1',
  * because it looks automatic.
  */
-const BUILD_STAMP = (
-  process.env.NEXT_PUBLIC_BUILD_STAMP ??
-  process.env.VERCEL_GIT_COMMIT_SHA ??
-  process.env.GITHUB_SHA ??
-  String(Date.now())
-)
-  // The build id becomes a URL path segment and a query value; keep it to
-  // characters that are safe in both, and short enough to read in a log.
-  .replace(/[^A-Za-z0-9_-]/g, '')
-  .slice(0, 40)
+/**
+ * Keep a candidate to characters that are safe in a URL path segment and a
+ * query value, and short enough to read in a log.
+ */
+const sanitiseStamp = (value) => String(value ?? '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40)
+
+/**
+ * An EMPTY value is "unset", not a stamp. `??` only skips null/undefined, and a
+ * Docker `ARG NEXT_PUBLIC_BUILD_STAMP=""` becomes an empty-string ENV in every
+ * image built without the build-arg, which used to yield an empty Next build id
+ * and a service worker registered as `/sw.js?v=` (a cache name that never
+ * rotates). So every candidate is sanitised first and the first one that is
+ * still non-empty wins; the timestamp can never be empty.
+ */
+const BUILD_STAMP =
+  [
+    process.env.NEXT_PUBLIC_BUILD_STAMP,
+    process.env.VERCEL_GIT_COMMIT_SHA,
+    process.env.GITHUB_SHA,
+  ]
+    .map(sanitiseStamp)
+    .find((candidate) => candidate.length > 0) ?? sanitiseStamp(Date.now())
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {

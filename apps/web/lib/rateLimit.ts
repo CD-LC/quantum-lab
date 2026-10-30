@@ -406,11 +406,30 @@ export function callerKey(headers: Headers, prefix: string, subject?: string | n
   return `${prefix}:ip:${normaliseAddress(address)}`
 }
 
-/** IPv6 → its /64 prefix; anything else (IPv4, junk) unchanged. */
+/**
+ * IPv6 → its /64 prefix; an IPv4 address (including an IPv4-mapped or
+ * embedded one such as `::ffff:1.2.3.4`) → the dotted IPv4; junk unchanged.
+ *
+ * An IPv4-mapped IPv6 address is an IPv4 client reported by a dual-stack
+ * socket. Truncating it to a /64 would put EVERY such client in one bucket
+ * (`0000:0000:0000:0000::/64`), so it is reduced to the IPv4 part instead.
+ * A `%zone` suffix (`fe80::1%eth0`) names a local interface and is not part of
+ * the address, so it is removed before expanding.
+ */
 export function normaliseAddress(address: string): string {
   // Strip a bracketed/ported form like [2001:db8::1]:443 before anything else.
-  const bare = address.startsWith('[') ? address.slice(1).split(']')[0] ?? address : address
-  if (!bare.includes(':')) return bare
+  const unbracketed = address.startsWith('[') ? address.slice(1).split(']')[0] ?? address : address
+  if (!unbracketed.includes(':')) return unbracketed
+
+  const bare = unbracketed.split('%')[0] ?? unbracketed
+
+  // Embedded IPv4 in the last 32 bits: `::ffff:1.2.3.4`, `::1.2.3.4`, `64:ff9b::1.2.3.4`.
+  const v4 = /^(.*:)(\d{1,3}(?:\.\d{1,3}){3})$/.exec(bare)
+  if (v4) {
+    const octets = (v4[2] ?? '').split('.').map(Number)
+    if (octets.every((o) => o >= 0 && o <= 255)) return octets.join('.')
+    return bare
+  }
 
   const expanded = expandIpv6(bare)
   if (!expanded) return bare

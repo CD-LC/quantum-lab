@@ -197,11 +197,17 @@ def parse_qasm(qasm: str) -> QuantumCircuit:
 def expanded_operation_count(circuit: QuantumCircuit, cap: int = MAX_EXPANDED_OPERATIONS) -> int:
     """Count the primitive operations a circuit expands to, stopping past ``cap``.
 
-    OpenQASM 3 ``gate`` definitions may call other definitions, and Qiskit keeps
-    them lazy, so ``circuit.size()`` is 1 for a circuit that transpiles to
-    131,074 gates. Only generic ``Gate``/``Instruction`` objects carry such a
-    user definition (library gates are subclasses), so only those are recursed
-    into; each distinct definition is counted once and memoised by name.
+    OpenQASM gate definitions may call other definitions, and Qiskit keeps them
+    lazy, so ``circuit.size()`` is 1 for a circuit that transpiles to 131,074
+    gates. The QASM 3 importer builds such gates as plain ``Gate`` objects but
+    the QASM 2 loader uses a private subclass, so the test is not the class: any
+    operation with a ``definition`` that is not the standard-library gate of its
+    name is recursed into. Each distinct definition is counted once and
+    memoised by name.
+
+    Control flow is counted by what it can execute: a ``for`` loop multiplies its
+    body by the iteration count, a ``while`` loop has no static bound and counts
+    as over the cap, and ``if``/``switch`` count their most expensive branch.
 
     Args:
         circuit: The parsed circuit.
@@ -210,38 +216,60 @@ def expanded_operation_count(circuit: QuantumCircuit, cap: int = MAX_EXPANDED_OP
     Returns:
         The expanded count, or ``cap + 1`` when it exceeds ``cap``.
     """
-    from qiskit.circuit import Gate, Instruction
+    from qiskit.circuit.library.standard_gates import get_standard_gate_name_mapping
 
-    memo: dict[str, int] = {}
+    standard = get_standard_gate_name_mapping()
+    over = cap + 1
+    memo: dict[tuple[str, int, int], int] = {}
 
-    def count(body: QuantumCircuit) -> int:
+    def is_standard(op: Any) -> bool:
+        reference = standard.get(op.name)
+        return reference is not None and type(op) is type(reference)
+
+    def iterations(op: Any) -> int:
+        indexset = op.params[0] if op.params else None
+        try:
+            return len(indexset) if indexset is not None else over
+        except TypeError:
+            return over
+
+    def count(body: QuantumCircuit, depth: int) -> int:
+        if depth > 64:
+            return over
         total = 0
         for item in body.data:
-            op = item.operation
-            definition = None
-            if type(op) in (Gate, Instruction):
-                name = op.name
-                if name in memo:
-                    total += memo[name]
-                    if total > cap:
-                        return cap + 1
-                    continue
-                definition = op.definition
-                if definition is not None:
-                    memo[name] = size = min(count(definition), cap + 1)
-                    total += size
-                    if total > cap:
-                        return cap + 1
-                    continue
-            total += 1
+            total += min(count_op(item.operation, depth), over)
             if total > cap:
-                return cap + 1
+                return over
         return total
 
+    def count_op(op: Any, depth: int) -> int:
+        name = op.name
+        if name == "while_loop":
+            return over
+        blocks = getattr(op, "blocks", None)
+        if blocks:
+            inner = max((count(block, depth + 1) for block in blocks), default=0)
+            if name == "for_loop":
+                inner *= iterations(op)
+            return max(1, min(inner, over))
+        if is_standard(op):
+            return 1
+        try:
+            definition = op.definition
+        except Exception:  # noqa: BLE001 - an op with no usable definition is a leaf
+            return 1
+        if definition is None:
+            return 1
+        key = (name, op.num_qubits, op.num_clbits)
+        if key not in memo:
+            memo[key] = min(count(definition, depth + 1), over)
+        return max(1, memo[key])
+
     try:
-        return count(circuit)
+        return count(circuit, 0)
     except RecursionError:
-        return cap + 1
+        return over
 
 
 def assert_parsed_circuit_is_affordable(circuit: QuantumCircuit) -> None:
@@ -266,8 +294,8 @@ def assert_parsed_circuit_is_affordable(circuit: QuantumCircuit) -> None:
     if expanded_operation_count(circuit) > MAX_EXPANDED_OPERATIONS:
         raise ValueError(
             "Circuit expands to more than "
-            f"{MAX_EXPANDED_OPERATIONS} operations once its gate definitions are "
-            "unrolled; simplify the nested gate definitions."
+            f"{MAX_EXPANDED_OPERATIONS} operations once its gate definitions and loops "
+            "are unrolled; simplify the nested gate definitions or loops."
         )
 
 
