@@ -21,8 +21,37 @@
 import { NextResponse, type NextRequest } from 'next/server'
 import { applySecurityHeaders } from '@/lib/security/headers'
 
+/**
+ * True when a pathname contains a percent-escape that is not valid UTF-8
+ * (`%E0%A4%A`, a lone `%`). Next decodes dynamic segments before any page or
+ * handler code runs and answers 500 — with none of our headers — when that
+ * throws, so such a path is refused here instead. Checked per segment so one
+ * bad segment is found without decoding `%2F` into a separator first. The
+ * `includes('%')` guard keeps the common case a single string scan.
+ */
+export function hasMalformedEncoding(pathname: string): boolean {
+  if (!pathname.includes('%')) return false
+  for (const segment of pathname.split('/')) {
+    if (!segment.includes('%')) continue
+    try {
+      decodeURIComponent(segment)
+    } catch {
+      return true
+    }
+  }
+  return false
+}
+
 export function proxy(request: NextRequest): NextResponse {
-  const response = NextResponse.next()
+  const malformed = hasMalformedEncoding(request.nextUrl.pathname)
+  // A path that cannot be decoded can never name a real page or route, so it is
+  // a 404 (what the static routes already answered), not Next's bare 500.
+  const response = malformed
+    ? new NextResponse('Not found', {
+        status: 404,
+        headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' },
+      })
+    : NextResponse.next()
 
   // `x-forwarded-proto` is what a proxy/CDN reports; nextUrl.protocol is what
   // this process sees. Either being https is enough to justify HSTS.

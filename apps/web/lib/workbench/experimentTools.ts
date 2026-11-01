@@ -14,10 +14,13 @@
  *   · They write nothing except the record. A step's result is computed by
  *     lib/workbench/targets.ts — the ideal simulator, the noise model, or the
  *     hardware route with the caller's own bearer token and every gate intact.
- *   · Identity is attribution only. A record's `owner` is the verified caller
- *     when the request carried a token (resolved by the caller of this
- *     module, never from a tool argument); records are readable by anyone
- *     who can reach the deployment.
+ *   · A record's `owner` is the verified caller when the request carried a
+ *     token (resolved by the caller of this module, never from a tool
+ *     argument). Records are readable by anyone who can reach the deployment,
+ *     but the owner's account id is never part of what is returned (only
+ *     `signedInAuthor`), and an owned record can be written to only by its
+ *     owner. Writes are rate-limited per caller (account when verified, else
+ *     the transport-trusted address) so the shared notebook cannot be flooded.
  *   · A hardware step that is refused (no token, wrong plan, quota) records
  *     nothing: the tool error carries the route's own message, and the
  *     notebook stays a record of things that happened.
@@ -34,11 +37,15 @@ import {
   MAX_STEPS_PER_EXPERIMENT,
   MAX_TITLE_CHARS,
   summarise,
+  toPublic,
+  toPublicSummary,
   type Experiment,
   type ExperimentStore,
 } from '@/lib/workbench/experiments'
 import { getExperimentStore } from '@/lib/workbench/experimentStore'
 import { verifiedCallerId } from '@/lib/security/auth'
+import { callerKey, rateLimit, type RateLimitRule } from '@/lib/rateLimit'
+import { reportError } from '@/lib/observability/report'
 import {
   DEFAULT_NOISE,
   DEFAULT_SHOTS,
@@ -72,24 +79,75 @@ function err(message: string): ToolResult {
  */
 export type OwnerResolver = (ctx: ToolCallContext) => Promise<string | null>
 
+/** Per-caller write ceilings, one rule per write tool. */
+export interface ExperimentWriteLimits {
+  create: RateLimitRule
+  step: RateLimitRule
+  conclude: RateLimitRule
+}
+
+/**
+ * Per hour, per caller. A person working through an experiment makes a few
+ * dozen calls; an unauthenticated loop at the transport's 1,000/hour would
+ * otherwise insert ~1,000 public records an hour per address.
+ */
+export const DEFAULT_WRITE_LIMITS: ExperimentWriteLimits = {
+  create: { limit: 20, windowMs: 3_600_000 },
+  step: { limit: 150, windowMs: 3_600_000 },
+  conclude: { limit: 40, windowMs: 3_600_000 },
+}
+
 export interface ExperimentToolsOptions {
   store: ExperimentStore
   hardware?: HardwareSubmitter
   resolveOwner?: OwnerResolver
+  limits?: ExperimentWriteLimits
 }
 
-/** The record as tools return it: the full shape plus a link a human can open. */
+/**
+ * The record as tools return it: the public shape (no account id) plus a link
+ * a human can open.
+ */
 function present(e: Experiment): Record<string, unknown> {
+  const pub = toPublic(e)
   return {
-    ...e,
-    steps: e.steps.map((s) => ({ ...s, targetLabel: describeTarget(s.target) })),
+    ...pub,
+    steps: pub.steps.map((s) => ({ ...s, targetLabel: describeTarget(s.target) })),
     url: `/workbench/experiments/${e.id}`,
   }
 }
 
 function storeFailure(cause: unknown): ToolResult {
   if (cause instanceof ExperimentError) return err(cause.message)
-  return err(`Experiment storage failed: ${cause instanceof Error ? cause.message : String(cause)}`)
+  // The raw cause can carry backend text (table, column, host); it goes to
+  // observability and the caller gets a fixed sentence.
+  reportError(cause, { module: 'workbench/experimentTools', stage: 'store' })
+  return err('The experiment store is unavailable right now; try again later.')
+}
+
+/**
+ * Charge one write against the caller's bucket: their account when verified,
+ * else the transport-trusted address (never a raw forwarded header).
+ */
+async function chargeWrite(
+  ctx: ToolCallContext,
+  owner: string | null,
+  action: string,
+  rule: RateLimitRule,
+): Promise<ToolResult | null> {
+  const headers = new Headers()
+  const address = (ctx.clientIp ?? ctx.forwardedFor ?? '').trim().slice(0, 64)
+  if (address) headers.set('cf-connecting-ip', address)
+  const decision = await rateLimit(callerKey(headers, `exp-${action}`, owner), rule)
+  if (decision.allowed) return null
+  const minutes = Math.max(1, Math.ceil((decision.resetAt - Date.now()) / 60_000))
+  return err(`Too many experiment writes from this caller; try again in about ${minutes} min.`)
+}
+
+/** An owned record is writable only by its owner. */
+function notYours(record: Experiment, owner: string | null): ToolResult | null {
+  if (record.owner === null || record.owner === owner) return null
+  return err('This experiment belongs to another account; start your own with create_experiment.')
 }
 
 const TARGET_SCHEMA = {
@@ -116,6 +174,7 @@ export function createExperimentTools(options: ExperimentToolsOptions): McpToolD
   const { store } = options
   const hardware = options.hardware ?? routeHardwareSubmitter
   const resolveOwner: OwnerResolver = options.resolveOwner ?? (async () => null)
+  const limits = options.limits ?? DEFAULT_WRITE_LIMITS
 
   const createExperiment: McpToolDef = {
     name: 'create_experiment',
@@ -146,6 +205,8 @@ export function createExperimentTools(options: ExperimentToolsOptions): McpToolD
       if (!hypothesis.ok) return err(hypothesis.error)
       try {
         const owner = await resolveOwner(ctx)
+        const limited = await chargeWrite(ctx, owner, 'create', limits.create)
+        if (limited) return limited
         const record = await store.create({ title: title.value, hypothesis: hypothesis.value, owner })
         return ok({
           ...present(record),
@@ -203,12 +264,18 @@ export function createExperimentTools(options: ExperimentToolsOptions): McpToolD
       // hardware submission against a concluded or missing experiment would
       // otherwise be billed and then not recorded.
       let existing: Experiment | null
+      let owner: string | null
       try {
+        owner = await resolveOwner(ctx)
+        const limited = await chargeWrite(ctx, owner, 'step', limits.step)
+        if (limited) return limited
         existing = await store.get(id.value)
       } catch (cause) {
         return storeFailure(cause)
       }
       if (!existing) return err(`No experiment with id "${id.value}". Call create_experiment first.`)
+      const foreign = notYours(existing, owner)
+      if (foreign) return foreign
       if (existing.conclusion !== null) {
         return err(`Experiment "${existing.title}" is concluded; create a new experiment to keep running.`)
       }
@@ -259,7 +326,9 @@ export function createExperimentTools(options: ExperimentToolsOptions): McpToolD
     description:
       'Close an experiment with a conclusion: what the steps showed, whether the hypothesis ' +
       'survived, and what you would run next. After this no further steps can be added. ' +
-      'Calling it again replaces the conclusion (the last word wins) but never touches the steps.',
+      'The account that created the experiment can call it again to replace the conclusion (never the ' +
+      'steps); an experiment created without a token keeps its first conclusion. Only the owning ' +
+      'account can write to an experiment it created while signed in.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -271,12 +340,24 @@ export function createExperimentTools(options: ExperimentToolsOptions): McpToolD
       },
       required: ['experiment_id', 'conclusion'],
     },
-    handler: async (args) => {
+    handler: async (args, ctx) => {
       const id = str(args.experiment_id, 100, 'experiment_id')
       if (!id.ok) return err(id.error)
       const conclusion = str(args.conclusion, MAX_CONCLUSION_CHARS, 'conclusion')
       if (!conclusion.ok) return err(conclusion.error)
       try {
+        const owner = await resolveOwner(ctx)
+        const limited = await chargeWrite(ctx, owner, 'conclude', limits.conclude)
+        if (limited) return limited
+        const existing = await store.get(id.value)
+        if (!existing) return err(`No experiment with id "${id.value}".`)
+        const foreign = notYours(existing, owner)
+        if (foreign) return foreign
+        // Only an account can revise its own write-up. An anonymous record has
+        // no one to prove authorship, so its first conclusion is final.
+        if (existing.conclusion !== null && existing.owner === null) {
+          return err('This experiment is already concluded and was written anonymously, so it cannot be rewritten.')
+        }
         const updated = await store.conclude(id.value, conclusion.value)
         return ok(present(updated))
       } catch (cause) {
@@ -303,7 +384,7 @@ export function createExperimentTools(options: ExperimentToolsOptions): McpToolD
         return ok({
           count: experiments.length,
           storage: store.kind,
-          experiments: experiments.map((e) => ({ ...e, url: `/workbench/experiments/${e.id}` })),
+          experiments: experiments.map((e) => ({ ...toPublicSummary(e), url: `/workbench/experiments/${e.id}` })),
         })
       } catch (cause) {
         return storeFailure(cause)
@@ -330,7 +411,7 @@ export function createExperimentTools(options: ExperimentToolsOptions): McpToolD
       try {
         const record = await store.get(id.value)
         if (!record) return err(`No experiment with id "${id.value}".`)
-        return ok({ ...present(record), summary: summarise(record) })
+        return ok({ ...present(record), summary: toPublicSummary(summarise(record)) })
       } catch (cause) {
         return storeFailure(cause)
       }

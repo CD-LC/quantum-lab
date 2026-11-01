@@ -49,6 +49,12 @@ class Settings(BaseSettings):
         max_history_turns: Prior turns of conversation accepted per request.
         max_message_chars: Characters accepted in any single turn.
         max_shots: Ceiling on the ``shots`` argument of ``run_quantum_circuit``.
+        llm_request_timeout: Seconds before a single LLM call is abandoned.
+        max_qubits: Qubit ceiling for the local simulation fallback.
+        max_circuit_gates: Expanded-gate ceiling for the local simulation.
+        max_qasm_chars: Characters of QASM ``run_quantum_circuit`` accepts.
+        max_sim_work: Estimated-work ceiling for the local simulation.
+        sim_max_memory_mb: Memory ceiling handed to Aer.
     """
 
     gemini_api_key: str | None = None
@@ -103,7 +109,18 @@ class Settings(BaseSettings):
     #: steps but not their duration: a local Aer simulation is one step and can
     #: run for minutes. This bounds the process time an anonymous request can
     #: hold, which max_tool_rounds alone does not.
-    max_agent_seconds: float = 60.0
+    #: Kept below the web route's 25 s AGENT_TIMEOUT_MS (apps/web/app/api/agent/
+    #: route.ts): a run the web has already abandoned is billed and discarded.
+    #: The check is made between tool rounds, so one round may overshoot it by
+    #: up to ``llm_request_timeout``; each tool call is bounded separately.
+    #: A run that hits this limit is reported as a failure (502), not a reply,
+    #: so the web falls back to the next tier; keep it <= 22 so that fallback
+    #: still has room inside the web's 25 s budget.
+    max_agent_seconds: float = 20.0
+
+    #: Per-call timeout handed to the LLM client. LiteLLM's own default is 600 s,
+    #: and a stalled provider endpoint would pin a worker thread for that long.
+    llm_request_timeout: float = 20.0
 
     #: Prior turns carried into the prompt. The whole history is re-sent on
     #: every request and billed every time, and a long history is where a
@@ -119,6 +136,26 @@ class Settings(BaseSettings):
     #: this an injected "run it with 500000000 shots" burns CPU in this process
     #: with nothing in its way. Matches services/api's max_shots.
     max_shots: int = 20000
+
+    #: Local-simulation bounds for ``run_quantum_circuit`` (reached when the
+    #: execution API is unreachable). Without them one anonymous message can ask
+    #: this process to allocate a 2^n statevector or expand a nested-gate bomb
+    #: inside a 0.5 GiB / 0.25 vCPU container. ``max_qubits`` matches
+    #: ``paper.MAX_RUNNABLE_QUBITS``.
+    max_qubits: int = 16
+    #: Ceiling on the gate count AFTER custom gate definitions are expanded.
+    max_circuit_gates: int = 5000
+    #: Characters of QASM accepted by ``run_quantum_circuit``. Rejected (not
+    #: truncated, which would silently run a different circuit) above this.
+    #: Matches the 20 000 the HTTP schema accepts.
+    max_qasm_chars: int = 20000
+    #: Ceiling on estimated simulation work: expanded gates * 2^qubits, times
+    #: shots when the circuit measures mid-circuit or resets (Aer then
+    #: re-simulates every shot).
+    max_sim_work: int = 1_000_000_000
+    #: Passed to ``AerSimulator(max_memory_mb=...)`` so Aer refuses rather than
+    #: allocates beyond this. Aer's own default is host RAM, not the cgroup.
+    sim_max_memory_mb: int = 256
 
     model_config = SettingsConfigDict(
         env_file=".env",

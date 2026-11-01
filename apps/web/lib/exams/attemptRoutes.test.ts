@@ -757,3 +757,174 @@ describe('rate limiting an identity the server just invented', () => {
     expect(statuses[10]).toBe(429)
   })
 })
+
+// ────────────────────────────────────────────────────────────
+describe('request bodies are capped, after the rate limit', () => {
+  it('refuses an oversized body on every write route with 413', async () => {
+    const browser = signedIn('user-bigbody')
+    const started = await browser.start()
+    const attemptId = (started.body.attempt as { id: string }).id
+    const pad = 'a'.repeat(200_000)
+
+    const put = await browser.saveAnswers(FOUNDATIONS, { attemptId, pad })
+    const sub = await browser.submit(FOUNDATIONS, { attemptId, pad })
+    const cert = await browser.claim(FOUNDATIONS, { attemptId, name: 'Ada', pad })
+    expect([put.status, sub.status, cert.status]).toEqual([413, 413, 413])
+
+    // Nothing was closed by the refused submit.
+    const after = await browser.state()
+    expect(after.body.state).toBe('open')
+  })
+
+  it('refuses an oversized body without content-length too (streamed)', async () => {
+    const big = new TextEncoder().encode(JSON.stringify({ attemptId: 'x', pad: 'a'.repeat(200_000) }))
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(big)
+        controller.close()
+      },
+    })
+    const req = new Request('http://app.test/api/exams/foundations-cert/answers', {
+      method: 'PUT',
+      headers: { 'x-forwarded-for': '203.0.113.250' },
+      body: stream,
+      // @ts-expect-error duplex is required by undici for stream bodies
+      duplex: 'half',
+    })
+    const res = await answersRoute.PUT(req, { params: Promise.resolve({ examId: FOUNDATIONS }) } as never)
+    expect(res.status).toBe(413)
+  })
+
+  it('rate limits before reading the body', async () => {
+    const ip = '203.0.113.251'
+    const pad = 'a'.repeat(200_000)
+    const statuses: number[] = []
+    for (let i = 0; i < 12; i += 1) {
+      statuses.push((await new Browser(ip).submit(FOUNDATIONS, { attemptId: 'x', pad })).status)
+    }
+    // START_LIMIT is 10/min for submit: the 11th is a 429, not a 413.
+    expect(statuses.slice(0, 10).every((s) => s === 413)).toBe(true)
+    expect(statuses[10]).toBe(429)
+  })
+
+  it('still accepts a normal-sized body', async () => {
+    const browser = signedIn('user-smallbody')
+    const started = await browser.start()
+    const attemptId = (started.body.attempt as { id: string }).id
+    expect((await browser.saveAnswers(FOUNDATIONS, { attemptId, answers: {} })).status).toBe(200)
+  })
+})
+
+// ────────────────────────────────────────────────────────────
+describe('answer-key harvesting', () => {
+  it('withholds the key for every question an empty submission left blank', async () => {
+    const browser = signedIn('user-harvest')
+    const started = await browser.start()
+    const attemptId = (started.body.attempt as { id: string }).id
+    const submitted = await browser.submit(FOUNDATIONS, { attemptId, answers: {} })
+    const review = (submitted.body.result as { review: Array<Record<string, unknown>> }).review
+    expect(review.length).toBe(15)
+    for (const q of review) {
+      expect(q.answered).toBe(false)
+      expect(q.correctIds).toBeUndefined()
+      expect(q.correctNumber).toBeUndefined()
+      expect(q.tolerance).toBeUndefined()
+      expect(q.explanation).toBeUndefined()
+    }
+  })
+
+  it('refuses a new paper inside the cooldown after a fail, then allows it', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-22T10:00:00Z'))
+    const browser = signedIn('user-cooldown')
+    const started = await browser.start()
+    const attemptId = (started.body.attempt as { id: string }).id
+    const failed = await browser.submit(FOUNDATIONS, { attemptId, answers: {} })
+    expect((failed.body.result as Record<string, unknown>).retakeAvailableAt).toBeDefined()
+
+    const tooSoon = await browser.start()
+    expect(tooSoon.status).toBe(429)
+    expect(typeof tooSoon.body.retakeAvailableAt).toBe('string')
+
+    vi.setSystemTime(new Date('2026-10-22T10:16:00Z'))
+    const later = await browser.start()
+    expect(later.status).toBe(201)
+  })
+
+  it('does not delay a candidate who passed', async () => {
+    const browser = signedIn('user-passretake')
+    const started = await browser.start()
+    const ids = (started.body.paper as Array<{ id: string }>).map((q) => q.id)
+    const attemptId = (started.body.attempt as { id: string }).id
+    const done = await browser.submit(FOUNDATIONS, {
+      attemptId,
+      answers: correctAnswersFor(FOUNDATIONS, ids),
+    })
+    expect((done.body.result as Record<string, unknown>).retakeAvailableAt).toBeUndefined()
+    expect((await browser.start()).status).toBe(201)
+  })
+})
+
+// ────────────────────────────────────────────────────────────
+describe('the countdown follows the server clock', () => {
+  it('carries serverNow on an open attempt', async () => {
+    const browser = signedIn('user-servernow')
+    const started = await browser.start()
+    const attempt = started.body.attempt as { serverNow?: string; startedAt: string }
+    expect(Math.abs(Date.parse(attempt.serverNow ?? '') - Date.parse(attempt.startedAt))).toBeLessThan(5_000)
+    const resumed = await browser.state()
+    expect(typeof (resumed.body.attempt as { serverNow?: string }).serverNow).toBe('string')
+  })
+})
+
+// ────────────────────────────────────────────────────────────
+describe('the guest cookie', () => {
+  it('is Secure over https and plain over http', async () => {
+    const mk = (url: string, extra: Record<string, string> = {}) =>
+      attemptRoute.GET(
+        new Request(url, { headers: { 'x-forwarded-for': '203.0.113.252', ...extra } }),
+        { params: Promise.resolve({ examId: FOUNDATIONS }) } as never
+      )
+    const https = await mk('https://app.test/api/exams/foundations-cert/attempt')
+    expect(https.headers.get('set-cookie')).toMatch(/; Secure/)
+    const proxied = await mk('http://app.test/api/exams/foundations-cert/attempt', {
+      'x-forwarded-proto': 'https',
+    })
+    expect(proxied.headers.get('set-cookie')).toMatch(/; Secure/)
+    const http = await mk('http://localhost/api/exams/foundations-cert/attempt')
+    expect(http.headers.get('set-cookie')).not.toMatch(/Secure/)
+  })
+})
+
+// ────────────────────────────────────────────────────────────
+describe('the badge route', () => {
+  it('answers a malformed percent-encoded id with 404, not a thrown 500', async () => {
+    const badge = await import('@/app/api/certificates/[certificateId]/badge/route')
+    for (const id of ['%E0', '%', '%25']) {
+      const res = await badge.GET(new Request('http://app.test/api/certificates/x/badge'), {
+        params: Promise.resolve({ certificateId: id }),
+      })
+      expect(res.status).toBe(404)
+    }
+  })
+})
+
+// ────────────────────────────────────────────────────────────
+describe('request body cap', () => {
+  it('refuses an oversized body on all three write routes, before parsing it', async () => {
+    const browser = signedIn('user-bigbody')
+    const started = await browser.start()
+    const attemptId = (started.body.attempt as { id: string }).id
+    const padding = 'x'.repeat(80 * 1024)
+    for (const call of [
+      () => browser.saveAnswers(FOUNDATIONS, { attemptId, answers: {}, pad: padding }),
+      () => browser.submit(FOUNDATIONS, { attemptId, answers: {}, pad: padding }),
+      () => browser.claim(FOUNDATIONS, { attemptId, name: 'A', pad: padding }),
+    ]) {
+      const res = await call()
+      expect(res.status).toBe(413)
+    }
+    // A normal body still works afterwards.
+    expect((await browser.saveAnswers(FOUNDATIONS, { attemptId, answers: {} })).status).toBe(200)
+  })
+})

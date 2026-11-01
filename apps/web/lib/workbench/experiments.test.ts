@@ -7,7 +7,8 @@
  * copy is exercised through setExperimentStore.
  */
 
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { __resetRateLimitForTests } from '@/lib/rateLimit'
 import {
   MemoryExperimentStore,
   ExperimentError,
@@ -44,6 +45,10 @@ function harness(hardware?: HardwareSubmitter) {
 // ────────────────────────────────────────────────────────────
 // The tool surface
 // ────────────────────────────────────────────────────────────
+
+beforeEach(() => {
+  __resetRateLimitForTests()
+})
 
 describe('experiment tools (memory adapter)', () => {
   it('registers exactly the five documented tools with object schemas', () => {
@@ -175,12 +180,88 @@ describe('experiment tools (memory adapter)', () => {
     expect(unknown.isError).toBe(true)
   })
 
-  it('records the verified owner when the request carried a token, null otherwise', async () => {
-    const { call } = harness()
+  it('records the verified owner internally, and never puts the account id in tool output', async () => {
+    const { call, store } = harness()
     const anon = structured(await call('create_experiment', { title: 't', hypothesis: 'h' }))
-    expect(anon.owner).toBeNull()
+    expect(anon.signedInAuthor).toBe(false)
+    expect(anon).not.toHaveProperty('owner')
     const signed = structured(await call('create_experiment', { title: 't', hypothesis: 'h' }, { authorization: 'Bearer x' }))
-    expect(signed.owner).toBe('user-1')
+    expect(signed.signedInAuthor).toBe(true)
+    expect(JSON.stringify(signed)).not.toContain('user-1')
+    expect((await store.get(signed.id as string))?.owner).toBe('user-1')
+
+    const listed = structured(await call('list_experiments', {}))
+    expect(JSON.stringify(listed)).not.toContain('user-1')
+    const one = structured(await call('get_experiment', { experiment_id: signed.id as string }))
+    expect(JSON.stringify(one)).not.toContain('user-1')
+  })
+
+  it('an owned record is writable only by its owner; an anonymous conclusion is final', async () => {
+    const { call } = harness()
+    const mine = structured(await call('create_experiment', { title: 't', hypothesis: 'h' }, { authorization: 'Bearer x' }))
+    const id = mine.id as string
+    const anonStep = await call('run_step', { experiment_id: id, qasm: BELL, target: 'simulator' })
+    expect(anonStep.isError).toBe(true)
+    expect(anonStep.content[0].text).toMatch(/belongs to another account/)
+    const anonConclude = await call('conclude_experiment', { experiment_id: id, conclusion: 'defaced' })
+    expect(anonConclude.isError).toBe(true)
+    expect((await call('run_step', { experiment_id: id, qasm: BELL, target: 'simulator' }, { authorization: 'Bearer x' })).isError).not.toBe(true)
+    expect((await call('conclude_experiment', { experiment_id: id, conclusion: 'one' }, { authorization: 'Bearer x' })).isError).not.toBe(true)
+    expect((await call('conclude_experiment', { experiment_id: id, conclusion: 'two' }, { authorization: 'Bearer x' })).isError).not.toBe(true)
+
+    const open = structured(await call('create_experiment', { title: 't', hypothesis: 'h' }))
+    expect((await call('conclude_experiment', { experiment_id: open.id as string, conclusion: 'first' })).isError).not.toBe(true)
+    const second = await call('conclude_experiment', { experiment_id: open.id as string, conclusion: 'rewritten' })
+    expect(second.isError).toBe(true)
+  })
+
+  it('rate-limits writes per caller: the 4th create from one address is refused, another address is not', async () => {
+    const store = new MemoryExperimentStore()
+    const tools = createExperimentTools({
+      store,
+      limits: {
+        create: { limit: 3, windowMs: 3_600_000 },
+        step: { limit: 3, windowMs: 3_600_000 },
+        conclude: { limit: 3, windowMs: 3_600_000 },
+      },
+    })
+    const create = tools.find((t) => t.name === 'create_experiment') as McpToolDef
+    const a = { clientIp: '203.0.113.7' }
+    for (let i = 0; i < 3; i++) {
+      expect((await create.handler({ title: 't', hypothesis: 'h' }, a)).isError, `create ${i + 1}`).not.toBe(true)
+    }
+    const fourth = await create.handler({ title: 't', hypothesis: 'h' }, a)
+    expect(fourth.isError).toBe(true)
+    expect(fourth.content[0].text).toMatch(/Too many experiment writes/)
+    expect((await create.handler({ title: 't', hypothesis: 'h' }, { clientIp: '203.0.113.8' })).isError).not.toBe(true)
+    expect((await store.list()).length).toBe(4)
+  })
+
+  it('a storage failure reaches the caller as a fixed sentence, not the backend text', async () => {
+    const store = new MemoryExperimentStore()
+    vi.spyOn(store, 'create').mockRejectedValue(new Error('relation "public.experiments" violates constraint secret_fk'))
+    const create = createExperimentTools({ store }).find((t) => t.name === 'create_experiment') as McpToolDef
+    const result = await create.handler({ title: 't', hypothesis: 'h' }, {})
+    expect(result.isError).toBe(true)
+    expect(result.content[0].text).not.toContain('secret_fk')
+    expect(result.content[0].text).toMatch(/unavailable/)
+  })
+
+  it('refuses to store a step whose result is oversized', async () => {
+    const store = new MemoryExperimentStore()
+    const record = await store.create({ title: 't', hypothesis: 'h' })
+    const huge = { kind: 'counts', counts: { '0': 1 }, shots: 1, numQubits: 1, gateCount: 1, junk: 'x'.repeat(200_000) }
+    await expect(
+      store.appendStep(record.id, {
+        qasm: BELL,
+        target: { kind: 'simulator' },
+        shots: 1,
+        seed: null,
+        result: huge as never,
+        note: '',
+      }),
+    ).rejects.toMatchObject({ code: 'too-large' })
+    expect((await store.get(record.id))?.steps).toHaveLength(0)
   })
 
   it('hardware target: no token → refusal and no step; token → job recorded via the injected submitter', async () => {

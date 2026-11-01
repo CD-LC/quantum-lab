@@ -27,12 +27,18 @@ interface SentMessage {
 }
 type Caller = { id: string; email: string } | null
 
-const sendEmail = vi.fn(async (_input: SentMessage) => ({ sent: true as const, id: 'msg_test' }))
+const sendEmail = vi.fn(
+  async (_input: SentMessage): Promise<{ sent: true; id: string } | { sent: false; reason: string }> => ({
+    sent: true,
+    id: 'msg_test',
+  })
+)
 const verifiedCaller = vi.fn(async (_req: Request): Promise<Caller> => null)
 
 vi.mock('@/lib/email/client', () => ({
   sendEmail: (input: SentMessage) => sendEmail(input),
   isEmailConfigured: true,
+  NOT_CONFIGURED_REASON: 'Email is not configured; set RESEND_API_KEY to send messages. The message was not delivered.',
   FROM_ADDRESS: 'Qubit16 <test@example.com>',
 }))
 
@@ -74,6 +80,29 @@ afterEach(() => {
 })
 
 describe('POST /api/email', () => {
+  it('does not echo the provider’s own error text to the caller', async () => {
+    verifiedCaller.mockResolvedValue({ id: 'u1', email: 'learner@example.com' })
+    sendEmail.mockResolvedValueOnce({ sent: false, reason: 'API key is invalid' })
+
+    const response = await POST(post(WELCOME))
+    const body = await response.json()
+
+    expect(body.sent).toBe(false)
+    expect(JSON.stringify(body)).not.toContain('API key')
+    expect(body.reason).toBe('The message could not be sent right now.')
+  })
+
+  it('still reports the app’s own not-configured copy', async () => {
+    verifiedCaller.mockResolvedValue({ id: 'u1', email: 'learner@example.com' })
+    sendEmail.mockResolvedValueOnce({
+      sent: false,
+      reason: 'Email is not configured; set RESEND_API_KEY to send messages. The message was not delivered.',
+    })
+
+    const body = await (await POST(post(WELCOME))).json()
+    expect(body.reason).toMatch(/not configured/)
+  })
+
   it('refuses an anonymous caller and sends nothing', async () => {
     const response = await POST(post(WELCOME))
 

@@ -39,8 +39,37 @@ T = TypeVar("T")
 MAX_QASM_CHARS = 131_072
 
 #: `qreg q[12];` (QASM 2) and `qubit[12] q;` / `bit[12] c;` (QASM 3).
-_QASM2_REGISTER = re.compile(r"\b[qc]reg\s+\w+\s*\[\s*(\d+)\s*\]", re.IGNORECASE)
-_QASM3_REGISTER = re.compile(r"\b(?:qubit|bit)\s*\[\s*(\d+)\s*\]", re.IGNORECASE)
+#:
+#: The size is captured as ANY text up to the closing bracket, not just digits:
+#: OpenQASM 3 also accepts ``100_000``, ``0x186A0`` and ``50000*2``, and a guard
+#: that only recognised plain digits skipped those entirely (a ~90-byte
+#: ``qubit[4_000_000] q;`` then OOM-killed the replica). Anything that is not a
+#: plain decimal literal is treated as over the limit rather than evaluated.
+_QASM2_REGISTER = re.compile(r"\b[qc]reg\s+\w+\s*\[([^\]]*)\]", re.IGNORECASE)
+_QASM3_REGISTER = re.compile(r"\b(?:qubit|bit)\s*\[([^\]]*)\]", re.IGNORECASE)
+_PLAIN_DECIMAL = re.compile(r"\d{1,12}")
+_QASM_COMMENT = re.compile(r"//[^\n]*|/\*.*?(?:\*/|\Z)", re.DOTALL)
+
+
+def _is_numeric_size(size: str) -> bool:
+    """Whether a register-size bracket body is a plain numeric expression.
+
+    Args:
+        size: The text between the brackets, already stripped.
+
+    Returns:
+        True for literals and arithmetic on them (``12``, ``4_000_000``,
+        ``0x186A0``, ``50000*2``); False for empty text or anything naming an
+        identifier.
+    """
+    if not size:
+        return False
+    # Hex digits look like identifiers once the 0x prefix is split off, so test
+    # each whitespace/operator-separated token whole.
+    for token in re.split(r"[\s()+\-*/%]+", size):
+        if token and not re.fullmatch(r"\d[\w.]*", token):
+            return False
+    return True
 
 
 def guard_qasm(qasm: str, max_qubits: int | None = None) -> None:
@@ -68,13 +97,22 @@ def guard_qasm(qasm: str, max_qubits: int | None = None) -> None:
         )
 
     limit = settings.max_qubits if max_qubits is None else min(max_qubits, settings.max_qubits)
+    # Comments are not code: "// the qubit[ register" must not be read as one.
+    code = _QASM_COMMENT.sub(" ", qasm)
     for pattern in (_QASM2_REGISTER, _QASM3_REGISTER):
-        for match in pattern.finditer(qasm):
-            digits = match.group(1)
-            # A very long digit run is over the limit by definition, and int()
-            # on >4300 digits raises ValueError in Python 3.11+ (the int/str
-            # conversion guard) which would surface as a 500 rather than a 400.
-            declared = int(digits) if len(digits) <= 12 else limit + 1
+        for match in pattern.finditer(code):
+            size = match.group(1).strip()
+            if not _is_numeric_size(size):
+                # A named constant, an empty bracket or anything else that is
+                # not a literal expression: the parser resolves it and
+                # MAX_PARSED_QUBITS refuses it afterwards if it is too wide.
+                continue
+            # A plain decimal is compared exactly. Anything else (a very long
+            # digit run, underscores, hex/octal/binary, an expression, a
+            # constant name) cannot be evaluated cheaply here, so it is over
+            # the limit by definition. int() on >4300 digits would also raise
+            # ValueError in Python 3.11+ and surface as a 500 rather than a 400.
+            declared = int(size) if _PLAIN_DECIMAL.fullmatch(size) else limit + 1
             if declared > limit:
                 raise HTTPException(
                     status_code=400,

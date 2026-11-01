@@ -190,7 +190,10 @@ export function embedFrameAncestors(): string[] {
   for (const entry of raw.split(/[\s,]+/)) {
     if (!entry) continue
     try {
-      ancestors.add(new URL(entry).origin)
+      const url = new URL(entry)
+      // Only web origins: `javascript:` / `data:` parse, but their origin is
+      // the opaque "null", which must never reach a frame-ancestors list.
+      if (url.protocol === 'https:' || url.protocol === 'http:') ancestors.add(url.origin)
     } catch {
       // Dropped, not guessed at — see connectOrigins() for the rationale.
     }

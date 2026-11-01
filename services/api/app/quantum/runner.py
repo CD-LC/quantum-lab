@@ -15,7 +15,12 @@ from qiskit import QuantumCircuit, transpile
 
 from app.core.config import settings
 from app.quantum.backends import BackendInfo, get_backend
-from app.quantum.limits import MAX_NOISY_QUBITS, MAX_STATEVECTOR_QUBITS
+from app.quantum.limits import (
+    MAX_EXPANDED_OPERATIONS,
+    MAX_NOISY_QUBITS,
+    MAX_PARSED_QUBITS,
+    MAX_STATEVECTOR_QUBITS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -172,7 +177,7 @@ def parse_qasm(qasm: str) -> QuantumCircuit:
     errors: list[str] = []
     for label, parser in parsers:
         try:
-            return parser(qasm)
+            circuit = parser(qasm)
         # Qiskit's native importer surfaces Rust panics as PanicException, which
         # derives from BaseException, so a bare `except Exception` would let it
         # escape and take down the request.
@@ -180,8 +185,118 @@ def parse_qasm(qasm: str) -> QuantumCircuit:
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 raise
             errors.append(f"{label}: {exc}")
+            continue
+        # Outside the try: a refusal here is final, not a reason to try the next
+        # parser.
+        assert_parsed_circuit_is_affordable(circuit)
+        return circuit
 
     raise ValueError(f"Could not parse the circuit: {'; '.join(errors)}")
+
+
+def expanded_operation_count(circuit: QuantumCircuit, cap: int = MAX_EXPANDED_OPERATIONS) -> int:
+    """Count the primitive operations a circuit expands to, stopping past ``cap``.
+
+    OpenQASM gate definitions may call other definitions, and Qiskit keeps them
+    lazy, so ``circuit.size()`` is 1 for a circuit that transpiles to 131,074
+    gates. The QASM 3 importer builds such gates as plain ``Gate`` objects but
+    the QASM 2 loader uses a private subclass, so the test is not the class: any
+    operation with a ``definition`` that is not the standard-library gate of its
+    name is recursed into. Each distinct definition is counted once and
+    memoised by name.
+
+    Control flow is counted by what it can execute: a ``for`` loop multiplies its
+    body by the iteration count, a ``while`` loop has no static bound and counts
+    as over the cap, and ``if``/``switch`` count their most expensive branch.
+
+    Args:
+        circuit: The parsed circuit.
+        cap: Counts above this are clamped to ``cap + 1`` so the work stays bounded.
+
+    Returns:
+        The expanded count, or ``cap + 1`` when it exceeds ``cap``.
+    """
+    from qiskit.circuit.library.standard_gates import get_standard_gate_name_mapping
+
+    standard = get_standard_gate_name_mapping()
+    over = cap + 1
+    memo: dict[tuple[str, int, int], int] = {}
+
+    def is_standard(op: Any) -> bool:
+        reference = standard.get(op.name)
+        return reference is not None and type(op) is type(reference)
+
+    def iterations(op: Any) -> int:
+        indexset = op.params[0] if op.params else None
+        try:
+            return len(indexset) if indexset is not None else over
+        except TypeError:
+            return over
+
+    def count(body: QuantumCircuit, depth: int) -> int:
+        if depth > 64:
+            return over
+        total = 0
+        for item in body.data:
+            total += min(count_op(item.operation, depth), over)
+            if total > cap:
+                return over
+        return total
+
+    def count_op(op: Any, depth: int) -> int:
+        name = op.name
+        if name == "while_loop":
+            return over
+        blocks = getattr(op, "blocks", None)
+        if blocks:
+            inner = max((count(block, depth + 1) for block in blocks), default=0)
+            if name == "for_loop":
+                inner *= iterations(op)
+            return max(1, min(inner, over))
+        if is_standard(op):
+            return 1
+        try:
+            definition = op.definition
+        except Exception:  # noqa: BLE001 - an op with no usable definition is a leaf
+            return 1
+        if definition is None:
+            return 1
+        key = (name, op.num_qubits, op.num_clbits)
+        if key not in memo:
+            memo[key] = min(count(definition, depth + 1), over)
+        return max(1, memo[key])
+
+    try:
+        return count(circuit, 0)
+    except RecursionError:
+        return over
+
+
+def assert_parsed_circuit_is_affordable(circuit: QuantumCircuit) -> None:
+    """Refuse a parsed circuit whose width or expanded size is unbounded work.
+
+    This is the post-parse backstop behind ``guard_qasm``: that guard reads
+    source text and cannot see through a gate-definition tower, or evaluate every
+    register-size spelling OpenQASM 3 accepts.
+
+    Args:
+        circuit: The parsed circuit.
+
+    Raises:
+        ValueError: When the circuit is wider than ``MAX_PARSED_QUBITS`` or
+            expands to more than ``MAX_EXPANDED_OPERATIONS`` operations.
+    """
+    if circuit.num_qubits > MAX_PARSED_QUBITS:
+        raise ValueError(
+            f"Circuit has {circuit.num_qubits} qubits; this service accepts at most "
+            f"{MAX_PARSED_QUBITS}."
+        )
+    if expanded_operation_count(circuit) > MAX_EXPANDED_OPERATIONS:
+        raise ValueError(
+            "Circuit expands to more than "
+            f"{MAX_EXPANDED_OPERATIONS} operations once its gate definitions and loops "
+            "are unrolled; simplify the nested gate definitions or loops."
+        )
 
 
 def _declares_qasm2(qasm: str) -> bool:

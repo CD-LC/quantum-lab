@@ -13,6 +13,8 @@
 import { NextResponse } from 'next/server'
 import { apiError } from '@/lib/apiError'
 import { callerKey, rateLimit, retryAfterHeaders, type RateLimitRule } from '@/lib/rateLimit'
+import { toPublicSummary } from '@/lib/workbench/experiments'
+import { reportError } from '@/lib/observability/report'
 import { getExperimentStore } from '@/lib/workbench/experimentStore'
 
 export const runtime = 'nodejs'
@@ -27,11 +29,9 @@ export async function GET(req: Request): Promise<Response> {
   const store = getExperimentStore()
   try {
     const experiments = await store.list(100)
-    return NextResponse.json({ storage: store.kind, experiments })
+    return NextResponse.json({ storage: store.kind, experiments: experiments.map(toPublicSummary) })
   } catch (cause) {
-    return NextResponse.json(
-      { error: cause instanceof Error ? cause.message : 'Could not list experiments.' },
-      { status: 503 },
-    )
+    reportError(cause, { route: 'api/workbench/experiments', stage: 'list' })
+    return apiError('upstream_unavailable', { message: 'The experiment store is unavailable right now.', status: 503 })
   }
 }

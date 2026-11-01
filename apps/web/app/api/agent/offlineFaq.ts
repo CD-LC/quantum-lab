@@ -19,7 +19,22 @@
  * drag `next/server` into the eval probe), and route.ts re-exports it.
  */
 export const OFFLINE_NOTE =
-  '\n\n_(Offline mode \u2014 set ANTHROPIC_API_KEY in .env.local for the full tutor.)_'
+  '\n\n_(The live tutor is busy or unavailable right now; here is an offline answer.)_'
+
+/**
+ * Developer-only hint for the "no key configured" case. Production learners
+ * must never be told to edit a .env.local file or restart a dev server, so it
+ * is emitted only when the app runs under `next dev`. NODE_ENV is read at call
+ * time (the eval probe runs this module under bare Node, where it is unset and
+ * the user-facing wording applies).
+ */
+export function devOnlyKeyHint(): string {
+  if (process.env.NODE_ENV !== 'development') return ''
+  return (
+    '\n\n_(Developer note: set ANTHROPIC_API_KEY in apps/web/.env.local and restart the dev server ' +
+    'to enable the live tutor.)_'
+  )
+}
 
 export interface FaqEntry {
   keys: string[]
@@ -296,7 +311,7 @@ export function offlineReply(lastUserMessage: string): string {
   }
 
   if (best && bestScore > 0) {
-    return best.answer + OFFLINE_NOTE
+    return best.answer + OFFLINE_NOTE + devOnlyKeyHint()
   }
 
   return (
@@ -306,7 +321,8 @@ export function offlineReply(lastUserMessage: string): string {
     '- "Why does measuring destroy interference?"\n' +
     "- \"Walk me through Grover's algorithm\"\n\n" +
     'I also have offline answers on qubits, measurement, the Hadamard gate, tunnelling, decoherence and the T1/T2 coherence times, phase, the Bloch sphere, Shor\'s algorithm, the quantum Fourier transform, the no-cloning theorem, VQE and NISQ hardware, QAOA, the quantum supremacy/advantage experiments, quantum annealing versus the gate model, why 2ⁿ amplitudes are not parallel universes, the hardware platforms qubits are built from, error correction and logical qubits, quantum key distribution, and teleportation. ' +
-    'To unlock the full tutor — which can reason about any question and look at your current circuit — add ANTHROPIC_API_KEY to apps/web/.env.local and restart the dev server.' +
-    OFFLINE_NOTE
+    'The live tutor — which can reason about any question and look at your current circuit — is not available at the moment; please try again in a little while.' +
+    OFFLINE_NOTE +
+    devOnlyKeyHint()
   )
 }

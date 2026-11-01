@@ -28,7 +28,7 @@ export const isStripeConfigured: boolean = SECRET_KEY.length > 0
  * against. Bumping the SDK may require bumping this literal — a mismatch is a
  * compile error, which is exactly the early warning we want.
  */
-const API_VERSION = '2024-10-28.acacia'
+export const STRIPE_API_VERSION = '2024-10-28.acacia'
 
 let client: Stripe | null = null
 
@@ -41,7 +41,7 @@ export function getStripe(): Stripe | null {
   if (!isStripeConfigured) return null
   if (client) return client
   try {
-    client = new Stripe(SECRET_KEY, { apiVersion: API_VERSION })
+    client = new Stripe(SECRET_KEY, { apiVersion: STRIPE_API_VERSION })
   } catch {
     // A malformed key should degrade to "billing unavailable", not crash a route.
     client = null

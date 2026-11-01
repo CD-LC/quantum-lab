@@ -197,3 +197,20 @@ secrets or env vars — that stays with `infra/azure/deploy.sh`. It is off until
 
 The web job fails outright if the two Supabase variables are empty, and the smoke test fails if
 `/account` comes back in "no accounts" mode.
+
+**What gets deployed.** The workflow logs in to Azure first, then compares each service with the
+commit its *live* image was built from (the image tag is `gh-<first 12 chars of the SHA>`), so a
+multi-commit push, or a push whose CI run was cancelled by a newer one, still ships everything that
+changed since production. If the live commit cannot be established (an image built by `deploy.sh`
+carries a timestamp tag, the tag is unreadable, or the commit is not in the clone) that service is
+deployed; a live commit already at or ahead of the commit being deployed is left alone. Pass
+`services` to `workflow_dispatch` to force a subset. Not tested against a real Azure subscription;
+the planning script is exercised against a stubbed `az` in `apps/web/lib/security/infraHardening.test.ts`.
+
+**Release identifier.** The web build receives the commit as `NEXT_PUBLIC_SENTRY_RELEASE` (what
+`/api/health` reports as `version` to a caller holding `HEALTH_DEEP_TOKEN`, and what Sentry tags events
+with) and its first 12 characters as `NEXT_PUBLIC_BUILD_STAMP` (the service-worker cache name, so
+rebuilding the same commit does not evict every installed user's cache). `deploy.sh` passes the same
+two from `git rev-parse HEAD`.
+
+**Runtime.** The web image and CI run Node 22 LTS.

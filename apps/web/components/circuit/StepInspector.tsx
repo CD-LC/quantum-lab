@@ -22,6 +22,7 @@ import {
 // A11Y: every spoken update from this control goes through the announcer —
 // see scheduleAnnounce() for why it is this and not a rendered live region.
 import { announce } from '@/lib/a11y/announce'
+import { clampTransportStep, maxFrameStep } from '@/lib/step-transport'
 
 /**
  * Amplitudes this small are numerical dust, not physics. Same cutoff
@@ -161,6 +162,7 @@ function formatDelta(before: number, after: number): string | null {
 export default function StepInspector({
   circuit,
   frames,
+  finalState,
   step,
   onStepChange,
 }: {
@@ -171,19 +173,46 @@ export default function StepInspector({
    * amplitudes under this circuit's gate labels.
    */
   frames: StateVector[]
+  /**
+   * The exact state after the last gate. `frames` is only a prefix of the
+   * circuit's steps when it was too long to keep every one (see
+   * simulateStepsChecked), in which case this is the only honest "end" state.
+   * Defaults to the last frame, which is right whenever nothing was cut.
+   */
+  finalState?: StateVector
   /** Gates applied so far, or null for "not stepping". */
   step: number | null
   onStepChange: (next: number | null) => void
 }) {
   const total = circuit.ops.length
-  const current = step === null ? total : Math.min(Math.max(step, 0), total)
+  /**
+   * The furthest step a frame exists for. Equal to `total` unless the frames
+   * were cut off; then the transport stops here, and only End (or a Forward
+   * that lands exactly on `total`) reaches the final state, shown from
+   * `finalState`. Without this, steps past the cut all read the last kept frame
+   * under the label of a gate that never produced it.
+   */
+  const maxStep = maxFrameStep(total, frames.length)
+  const frameCount = frames.length
+  const clampStep = useCallback(
+    (n: number) => clampTransportStep(n, total, frameCount),
+    [total, frameCount]
+  )
+  const current = step === null ? total : clampStep(step)
 
   /** The gate whose effect you are looking at, and the one that runs next. */
   const justApplied = current > 0 ? circuit.ops[current - 1] : undefined
   const nextOp = current < total ? circuit.ops[current] : undefined
 
-  const after = frames[Math.min(current, frames.length - 1)]
-  const before = frames[Math.min(Math.max(current - 1, 0), frames.length - 1)]
+  const atEnd = current >= total
+  const after = atEnd
+    ? (finalState ?? frames[Math.min(total, frames.length - 1)])
+    : frames[Math.min(current, frames.length - 1)]
+  // The state before the last gate may itself be past the kept frames; then
+  // there is no honest "before", and the table says so instead of guessing.
+  const beforeIndex = Math.max(current - 1, 0)
+  const before = beforeIndex <= frames.length - 1 ? frames[beforeIndex] : undefined
+  const framesCut = maxStep < total
 
   /**
    * The before/after table.
@@ -257,7 +286,7 @@ export default function StepInspector({
 
   const goTo = useCallback(
     (next: number, refusal: string) => {
-      const clamped = Math.min(Math.max(next, 0), total)
+      const clamped = clampStep(next)
       if (clamped === current) {
         scheduleAnnounce(refusal)
         return
@@ -265,7 +294,7 @@ export default function StepInspector({
       onStepChange(clamped)
       scheduleAnnounce(stepSummary(circuit.ops, clamped))
     },
-    [circuit.ops, current, onStepChange, scheduleAnnounce, total]
+    [circuit.ops, clampStep, current, onStepChange, scheduleAnnounce]
   )
 
   const toStart = useCallback(
@@ -392,7 +421,18 @@ export default function StepInspector({
           400ms would read as a stale readout. */}
       <p className="text-[11px] text-ink-secondary">{summary}</p>
 
-      {total === 0 ? null : (
+      {framesCut ? (
+        <p className="text-[11px] text-q-amber-text">
+          Stepping stops at step {maxStep}: this circuit is too long to keep every step at this
+          register size. End shows the exact final state.
+        </p>
+      ) : null}
+
+      {total === 0 ? null : !before ? (
+        <p className="text-[11px] text-ink-muted">
+          The step before this one was not kept, so there is no before/after table here.
+        </p>
+      ) : (
         <div className="overflow-x-auto rounded-lg border border-line">
           <table className="w-full text-xs">
             <caption className="sr-only">

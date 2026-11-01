@@ -38,7 +38,8 @@ import {
   upsertSnapshot,
 } from '@/lib/orgs/classroomStore'
 import { listMembers } from '@/lib/orgs/store'
-import { safeJson, isRecord } from '@/lib/security/validate'
+import { readJsonBody, isRecord } from '@/lib/security/validate'
+import { apiError } from '@/lib/apiError'
 import { verifiedCallerId } from '@/lib/security/auth'
 import { reportError } from '@/lib/observability/report'
 
@@ -108,7 +109,8 @@ export async function POST(req: Request): Promise<Response> {
   const limited = rateLimit(req, 'orgs-progress', 20)
   if (limited) return limited
 
-  const parsed = safeJson(await req.text(), BODY_BYTES)
+  const parsed = await readJsonBody(req, BODY_BYTES)
+  if (!parsed.ok && parsed.tooLarge) return apiError('payload_too_large')
   if (!parsed.ok) return bad(parsed.error, 400)
   if (!isRecord(parsed.value)) return bad('Expected a JSON object.', 400)
   const body = parsed.value

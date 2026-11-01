@@ -69,6 +69,15 @@ jobs:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
           fetch-depth: 0
 
+      # Logged in BEFORE planning: the plan compares each service with the
+      # commit its live image was built from, which needs a read of Azure.
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
       - name: Decide what to deploy
         id: plan
         env:
@@ -79,13 +88,49 @@ jobs:
           if [ -n "${REQUESTED// /}" ]; then
             list="$REQUESTED"
           else
-            # Compare with what is live: the image tag carries the commit it was built from.
-            base="$(git rev-parse "$HEAD_SHA~1" 2>/dev/null || git rev-parse "$HEAD_SHA")"
-            files="$(git diff --name-only "$base" "$HEAD_SHA")"
+            # Compare each service with the commit its LIVE image was built from
+            # (the image tag is gh-<first 12 chars of the SHA>), not with HEAD~1.
+            # HEAD~1 misses every earlier commit of a multi-commit push, and a
+            # push whose CI run was cancelled by a newer push never deploys at
+            # all, so its changes would otherwise stay undeployed for good.
+            #
+            # Safe fallback: whenever the live commit cannot be established
+            # (image not built by this workflow, tag unreadable, commit not in
+            # this clone) that service is deployed. Over-deploying is harmless;
+            # leaving production stale is not. A live commit that is already
+            # at or ahead of HEAD (a re-run of an older CI run) is left alone
+            # rather than rolled backwards.
+            patterns_web='^(apps/web/|packages/|package(-lock)?\.json)'
+            patterns_api='^services/api/'
+            patterns_agent='^services/agent/'
             list=""
-            echo "$files" | grep -qE '^(apps/web/|packages/|package(-lock)?\.json)' && list="$list web"
-            echo "$files" | grep -qE '^services/api/'   && list="$list api"
-            echo "$files" | grep -qE '^services/agent/' && list="$list agent"
+            for svc in web api agent; do
+              pattern_var="patterns_$svc"
+              live_tag="$(az containerapp show -n "quantum-lab-$svc" -g "$RESOURCE_GROUP" \
+                --query 'properties.template.containers[0].image' -o tsv 2>/dev/null | sed -n 's/.*:gh-\([0-9a-f]\{12\}\)$/\1/p' || true)"
+              live=""
+              if [ -n "$live_tag" ]; then
+                live="$(git rev-parse --verify --quiet "${live_tag}^{commit}" 2>/dev/null || true)"
+              fi
+              if [ -z "$live" ]; then
+                echo "$svc: live commit unknown, deploying"
+                list="$list $svc"; continue
+              fi
+              if git merge-base --is-ancestor "$HEAD_SHA" "$live" 2>/dev/null; then
+                echo "$svc: live ${live:0:12} is at or ahead of ${HEAD_SHA:0:12}, nothing to do"; continue
+              fi
+              if ! git merge-base --is-ancestor "$live" "$HEAD_SHA" 2>/dev/null; then
+                echo "$svc: live ${live:0:12} is not an ancestor of ${HEAD_SHA:0:12}, deploying"
+                list="$list $svc"; continue
+              fi
+              changed="$(git diff --name-only "$live" "$HEAD_SHA")"
+              if grep -qE "${!pattern_var}" <<<"$changed"; then
+                echo "$svc: changed since live ${live:0:12}, deploying"
+                list="$list $svc"
+              else
+                echo "$svc: unchanged since live ${live:0:12}"
+              fi
+            done
           fi
           echo "services=${list# }" >> "$GITHUB_OUTPUT"
           echo "Deploying: ${list:-nothing}"
@@ -100,14 +145,6 @@ jobs:
             echo "::error::Repository variables NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY are empty; the web image would ship with accounts off."
             exit 1
           fi
-
-      - name: Azure login (OIDC)
-        if: steps.plan.outputs.services != ''
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Build and roll out
         if: steps.plan.outputs.services != ''
@@ -132,7 +169,8 @@ jobs:
                   --build-arg "NEXT_PUBLIC_SUPABASE_URL=$SUPABASE_URL" --build-arg "NEXT_PUBLIC_SUPABASE_ANON_KEY=$SUPABASE_ANON" \
                   --build-arg "NEXT_PUBLIC_SENTRY_DSN=$SENTRY_DSN" --build-arg "NEXT_PUBLIC_LAUNCH_TRIAL_DAYS=$TRIAL_DAYS" \
                   --build-arg "NEXT_PUBLIC_LAUNCH_TRIAL_UNTIL=$TRIAL_UNTIL" --build-arg "NEXT_PUBLIC_ANALYTICS_ENDPOINT=$ANALYTICS_ENDPOINT" \
-                  --build-arg "NEXT_PUBLIC_DEVICE_TUTOR=$DEVICE_TUTOR" . ;;
+                  --build-arg "NEXT_PUBLIC_DEVICE_TUTOR=$DEVICE_TUTOR" \
+                  --build-arg "NEXT_PUBLIC_SENTRY_RELEASE=$SHA" --build-arg "NEXT_PUBLIC_BUILD_STAMP=${SHA::12}" . ;;
               api)   az acr build -r "$ACR_NAME" -g "$RESOURCE_GROUP" -t "quantum-lab/api:$tag"   -f services/api/Dockerfile   services/api ;;
               agent) az acr build -r "$ACR_NAME" -g "$RESOURCE_GROUP" -t "quantum-lab/agent:$tag" -f services/agent/Dockerfile services/agent ;;
               *) echo "::error::unknown service $svc"; exit 1 ;;

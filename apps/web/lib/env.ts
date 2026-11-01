@@ -200,6 +200,16 @@ export const ENV_VARS: readonly EnvVar[] = [
     readAt: 'lib/billing/entitlements.ts:53',
   },
   {
+    name: 'SETTINGS_ENCRYPTION_KEY',
+    requirement: 'optional',
+    scope: 'server',
+    unlocks:
+      'The AES key that seals BYOK vendor credentials and admin-set provider keys at rest. 64 hex chars (openssl rand -hex 32), or any string.',
+    withoutIt:
+      'Sealing falls back to a key DERIVED FROM SUPABASE_SERVICE_ROLE_KEY: it still works, but anyone who can read the service-role key can decrypt every stored credential, and rotating the service-role key makes them all unreadable. The app logs one loud warning per process and /api/health (trusted callers) reports byokKeyIsFallback. See docs/BYOK.md, "Moving off the fallback key".',
+    readAt: 'lib/platform/secretBox.ts:keyBytes',
+  },
+  {
     name: 'STRIPE_SECRET_KEY',
     requirement: 'optional',
     scope: 'server',

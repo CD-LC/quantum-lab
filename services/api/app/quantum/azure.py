@@ -16,6 +16,7 @@ which is a :class:`ValueError`, with the exact pip package or variable named.
 
 from __future__ import annotations
 
+import logging
 import os
 from datetime import datetime, timezone
 from typing import Any
@@ -23,6 +24,8 @@ from typing import Any
 from app.core.config import settings
 from app.quantum.credentials import AzureCredentials
 from app.quantum.hardware import MissingDependency
+
+logger = logging.getLogger(__name__)
 
 # Provider id used by the routes and the job records.
 PROVIDER_AZURE = "azure"
@@ -70,6 +73,23 @@ def _now() -> str:
         A timezone-aware timestamp, e.g. ``"2026-08-16T09:30:00+00:00"``.
     """
     return datetime.now(timezone.utc).isoformat()
+
+
+def _log_sdk_failure(action: str, exc: BaseException) -> None:
+    """Record the real SDK failure server-side; callers get a fixed message.
+
+    The text of an ``azure-quantum`` / ``azure-identity`` exception is not ours
+    to forward: it can carry the workspace endpoint it tried, a tenant id, a
+    request id or a response body, and for a BYOK request the endpoint is built
+    from values the *user* supplied. Echoing it would turn a bad credential
+    into a probe that reflects whatever the SDK saw. The operator reads the
+    real cause here; the caller reads a message that never varies.
+
+    Args:
+        action: What was being attempted, e.g. ``"connect to the workspace"``.
+        exc: The exception the SDK raised.
+    """
+    logger.warning("Azure Quantum: could not %s (%s: %s)", action, type(exc).__name__, exc)
 
 
 def _module_importable(name: str) -> bool:
@@ -257,15 +277,19 @@ def _workspace(credentials: AzureCredentials | None = None) -> Any:
                 credential=token_credential,
             )
         except Exception as exc:  # noqa: BLE001 - auth/network errors become 400s
+            _log_sdk_failure("connect to a user-supplied workspace", exc)
             raise ValueError(
-                "Could not connect to your Azure Quantum workspace: "
-                f"{exc}. Check that the service principal has access to the workspace."
+                "Could not connect to your Azure Quantum workspace. Check the "
+                "workspace resource id, region, tenant id and client id, that the "
+                "client secret has not expired, and that the service principal has "
+                "access to the workspace."
             ) from exc
 
     try:
         return workspace_cls(resource_id=azure_resource_id(), location=azure_location())
     except Exception as exc:  # noqa: BLE001 - auth/network errors become 400s
-        raise ValueError(f"Could not connect to the Azure Quantum workspace: {exc}") from exc
+        _log_sdk_failure("connect to the operator workspace", exc)
+        raise ValueError("Could not connect to the Azure Quantum workspace.") from exc
 
 
 def _validate_shots(shots: int) -> int:
@@ -400,8 +424,9 @@ def list_azure_targets() -> list[dict[str, Any]]:
     try:
         live = _live_azure_targets()
     except Exception as exc:  # noqa: BLE001
+        _log_sdk_failure("list live targets", exc)
         return [
-            _catalogue_entry(target, f"Could not reach Azure Quantum: {exc}")
+            _catalogue_entry(target, "Could not reach Azure Quantum.")
             for target in AZURE_TARGETS
         ]
 
@@ -468,7 +493,11 @@ def submit_azure_job(
     except ValueError:
         raise
     except Exception as exc:  # noqa: BLE001
-        raise ValueError(f"Azure Quantum rejected the job on '{target}': {exc}") from exc
+        _log_sdk_failure(f"submit a job to '{target}'", exc)
+        raise ValueError(
+            f"Azure Quantum rejected the job on '{target}'. Check that the target is "
+            "enabled in your workspace and that the circuit is supported by it."
+        ) from exc
 
     return {
         "job_id": str(getattr(job, "id", "")),
@@ -543,7 +572,8 @@ def poll_azure_job(
     try:
         job = workspace.get_job(job_id)
     except Exception as exc:  # noqa: BLE001
-        raise ValueError(f"Could not retrieve Azure Quantum job '{job_id}': {exc}") from exc
+        _log_sdk_failure(f"retrieve job {job_id!r}", exc)
+        raise ValueError(f"Could not retrieve Azure Quantum job '{job_id}'.") from exc
 
     status = _normalise_azure_status(_safe_status(job))
     payload: dict[str, Any] = {"job_id": job_id, "provider": PROVIDER_AZURE, "status": status}
@@ -553,7 +583,8 @@ def poll_azure_job(
             payload["counts"] = _counts_from_azure_result(job.get_results())
         except Exception as exc:  # noqa: BLE001
             payload["status"] = "error"
-            payload["error"] = f"The job finished but its result could not be read: {exc}"
+            _log_sdk_failure(f"read the result of job {job_id!r}", exc)
+            payload["error"] = "The job finished but its result could not be read."
     elif status == "error":
         details = getattr(job, "details", None)
         payload["error"] = str(

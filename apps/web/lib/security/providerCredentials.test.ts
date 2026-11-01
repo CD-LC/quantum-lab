@@ -107,7 +107,8 @@ const BRAKET_FIELDS = {
 }
 
 const AZURE_FIELDS = {
-  resource_id: '/subscriptions/0000/resourceGroups/rg/providers/Microsoft.Quantum/Workspaces/ws',
+  resource_id:
+    '/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg/providers/Microsoft.Quantum/Workspaces/ws',
   location: 'eastus',
   tenant_id: '11111111-1111-1111-1111-111111111111',
   client_id: '22222222-2222-2222-2222-222222222222',
@@ -220,6 +221,77 @@ describe('the secret/public split', () => {
     expect(split.ok).toBe(true)
     if (!split.ok) return
     expect(split.publicConfig).not.toHaveProperty('instance')
+  })
+})
+
+describe('public field shapes', () => {
+  const bad = (provider: 'ibm' | 'braket' | 'azure', fields: Record<string, string>, label: string) => {
+    const split = splitCredentialFields(provider, fields)
+    expect(split.ok).toBe(false)
+    if (split.ok) return
+    expect(split.error).toContain(label)
+    // The offending value is never echoed back.
+    for (const v of Object.values(fields)) {
+      if (v.includes('/') && v.includes('?')) expect(split.error).not.toContain(v)
+    }
+  }
+
+  it('accepts a well-formed credential for every provider', () => {
+    expect(splitCredentialFields('azure', AZURE_FIELDS).ok).toBe(true)
+    expect(splitCredentialFields('braket', BRAKET_FIELDS).ok).toBe(true)
+    expect(
+      splitCredentialFields('ibm', {
+        token: TOKEN,
+        instance: 'crn:v1:bluemix:public:quantum-computing:us-east:a/0123abcd:aaaa-bbbb::',
+      }).ok
+    ).toBe(true)
+    expect(splitCredentialFields('braket', { ...BRAKET_FIELDS, s3_prefix: 'team/run-1.d' }).ok).toBe(true)
+    expect(splitCredentialFields('braket', { ...BRAKET_FIELDS, region: 'ap-southeast-2' }).ok).toBe(true)
+  })
+
+  it('refuses an Azure location that could redirect the SDK request', () => {
+    for (const location of ['internal.host.example/x?', 'a@evil.example', 'east:443', 'x#y', 'ea', 'eastus.evil']) {
+      bad('azure', { ...AZURE_FIELDS, location }, 'Workspace region')
+    }
+  })
+
+  it('folds an Azure or AWS region to lower case rather than refusing it', () => {
+    const az = splitCredentialFields('azure', { ...AZURE_FIELDS, location: 'EastUS' })
+    expect(az.ok && az.publicConfig.location).toBe('eastus')
+    const aws = splitCredentialFields('braket', { ...BRAKET_FIELDS, region: 'US-East-1' })
+    expect(aws.ok && aws.publicConfig.region).toBe('us-east-1')
+  })
+
+  it('requires GUIDs for the tenant and client ids', () => {
+    bad('azure', { ...AZURE_FIELDS, tenant_id: 'contoso/../x' }, 'Directory (tenant) ID')
+    bad('azure', { ...AZURE_FIELDS, client_id: 'not-a-guid' }, 'Application (client) ID')
+  })
+
+  it('requires the full workspace resource id', () => {
+    bad('azure', { ...AZURE_FIELDS, resource_id: '/subscriptions/x' }, 'Workspace resource ID')
+    bad(
+      'azure',
+      { ...AZURE_FIELDS, resource_id: 'https://evil.example/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg/providers/Microsoft.Quantum/Workspaces/ws' },
+      'Workspace resource ID'
+    )
+    bad(
+      'azure',
+      { ...AZURE_FIELDS, resource_id: '/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg/providers/Microsoft.Quantum/Workspaces/ws?x=1' },
+      'Workspace resource ID'
+    )
+  })
+
+  it('refuses a malformed AWS region, bucket, prefix or access key id', () => {
+    bad('braket', { ...BRAKET_FIELDS, region: 'us-east-1/evil' }, 'AWS region')
+    bad('braket', { ...BRAKET_FIELDS, s3_bucket: 'Bad_Bucket' }, 'S3 bucket for results')
+    bad('braket', { ...BRAKET_FIELDS, s3_bucket: 'a..b' }, 'S3 bucket for results')
+    bad('braket', { ...BRAKET_FIELDS, s3_bucket: 'bucket/../x' }, 'S3 bucket for results')
+    bad('braket', { ...BRAKET_FIELDS, s3_prefix: '../../x' }, 'S3 key prefix')
+    bad('braket', { ...BRAKET_FIELDS, access_key_id: 'akia-lowercase' }, 'AWS access key ID')
+  })
+
+  it('refuses an IBM instance containing URL metacharacters', () => {
+    bad('ibm', { token: TOKEN, instance: 'crn:x@evil.example/?q' }, 'Instance CRN')
   })
 })
 

@@ -24,7 +24,7 @@ import { NextResponse } from 'next/server'
 import { apiError, badRequest } from '@/lib/apiError'
 import { callerKey, rateLimit, retryAfterHeaders, type RateLimitRule } from '@/lib/rateLimit'
 import { signInRequiredResponse, verifiedCallerId } from '@/lib/security/auth'
-import { isRecord, safeJson, str } from '@/lib/security/validate'
+import { isRecord, readJsonBody, str } from '@/lib/security/validate'
 import {
   getWebhookStore,
   registerEndpoint,
@@ -61,7 +61,8 @@ export async function POST(req: Request): Promise<Response> {
   const caller = await verifiedCallerId(req)
   if (!caller) return signInRequiredResponse()
 
-  const parsed = safeJson(await req.text(), 8_192)
+  const parsed = await readJsonBody(req, 8_192)
+  if (!parsed.ok && parsed.tooLarge) return apiError('payload_too_large')
   if (!parsed.ok) return badRequest(parsed.error)
   if (!isRecord(parsed.value)) return badRequest('Expected a JSON object.')
 
@@ -116,7 +117,8 @@ export async function DELETE(req: Request): Promise<Response> {
   const fromQuery = new URL(req.url).searchParams.get('id')
   let rawId: unknown = fromQuery
   if (!rawId) {
-    const parsed = safeJson(await req.text(), 2_048)
+    const parsed = await readJsonBody(req, 2_048)
+    if (!parsed.ok && parsed.tooLarge) return apiError('payload_too_large')
     if (parsed.ok && isRecord(parsed.value)) rawId = parsed.value.id
   }
   const id = str(rawId, 64, 'id')

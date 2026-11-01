@@ -164,17 +164,53 @@ interface Bucket {
   /** Window index; the map key carries it too, this catches a stale entry. */
   window: number
   count: number
+  /** Epoch ms at which this bucket's window ends; after that it is garbage. */
+  expiresAt: number
+  /** Window length, so eviction can tell a per-minute key from a daily quota. */
+  windowMs: number
 }
 
 /**
  * Keys are never swept on a timer — a `setInterval` in a serverless function is
  * a leak with no owner. A bucket is replaced lazily when its window rolls, and
- * the whole map is dropped past MAX_KEYS. Dropping everything is crude; the
- * failure mode is "some callers briefly get a fresh allowance", which is the
- * right direction to fail for a store that is already advisory.
+ * when the map reaches MAX_KEYS `makeRoom` evicts entries: expired windows
+ * first, then the OLDEST short-window keys, and only as a last resort the
+ * oldest long-window keys. It never clears the map.
+ *
+ * Clearing everything (what this did before) is not "some callers briefly get a
+ * fresh allowance": the same map holds the 24-hour LLM cost quotas, so a flush
+ * handed every caller a brand-new daily allowance, and 10 000 cheap one-minute
+ * keys are reached within hours on ordinary traffic. Per-minute keys are
+ * disposable (they expire in a minute); daily quota keys are what must survive.
  */
 const MAX_KEYS = 10_000
+/** Evict down to this many entries so the O(n) pass is amortised, not per request. */
+const EVICT_TO = Math.floor(MAX_KEYS * 0.9)
+/** A window at least this long is a cost quota (daily/hourly), kept longest. */
+const LONG_WINDOW_MS = 3_600_000
 const buckets = new Map<string, Bucket>()
+
+function makeRoom(now: number): void {
+  // 1. Expired windows are free to drop; they can never be read again.
+  for (const [k, b] of buckets) {
+    if (b.expiresAt <= now) buckets.delete(k)
+  }
+  if (buckets.size < MAX_KEYS) return
+
+  // 2. Still full of live keys: drop the oldest short-window ones first
+  //    (Map iteration order is insertion order).
+  for (const [k, b] of buckets) {
+    if (buckets.size <= EVICT_TO) break
+    if (b.windowMs < LONG_WINDOW_MS) buckets.delete(k)
+  }
+  if (buckets.size < MAX_KEYS) return
+
+  // 3. Nothing but long windows left: drop the oldest of those.
+  for (const k of buckets.keys()) {
+    if (buckets.size <= EVICT_TO) break
+    buckets.delete(k)
+  }
+}
 
 function countInMemory(key: string, rule: RateLimitRule, now: number): RateLimitDecision {
   const window = windowIndex(now, rule.windowMs)
@@ -183,8 +219,8 @@ function countInMemory(key: string, rule: RateLimitRule, now: number): RateLimit
   const existing = buckets.get(mapKey)
 
   if (!existing || existing.window !== window) {
-    if (buckets.size >= MAX_KEYS) buckets.clear()
-    buckets.set(mapKey, { window, count: 1 })
+    if (!existing && buckets.size >= MAX_KEYS) makeRoom(now)
+    buckets.set(mapKey, { window, count: 1, expiresAt: resetAt, windowMs: rule.windowMs })
     return { allowed: true, remaining: rule.limit - 1, resetAt, store: 'memory' }
   }
 
@@ -370,11 +406,30 @@ export function callerKey(headers: Headers, prefix: string, subject?: string | n
   return `${prefix}:ip:${normaliseAddress(address)}`
 }
 
-/** IPv6 → its /64 prefix; anything else (IPv4, junk) unchanged. */
-function normaliseAddress(address: string): string {
+/**
+ * IPv6 → its /64 prefix; an IPv4 address (including an IPv4-mapped or
+ * embedded one such as `::ffff:1.2.3.4`) → the dotted IPv4; junk unchanged.
+ *
+ * An IPv4-mapped IPv6 address is an IPv4 client reported by a dual-stack
+ * socket. Truncating it to a /64 would put EVERY such client in one bucket
+ * (`0000:0000:0000:0000::/64`), so it is reduced to the IPv4 part instead.
+ * A `%zone` suffix (`fe80::1%eth0`) names a local interface and is not part of
+ * the address, so it is removed before expanding.
+ */
+export function normaliseAddress(address: string): string {
   // Strip a bracketed/ported form like [2001:db8::1]:443 before anything else.
-  const bare = address.startsWith('[') ? address.slice(1).split(']')[0] ?? address : address
-  if (!bare.includes(':')) return bare
+  const unbracketed = address.startsWith('[') ? address.slice(1).split(']')[0] ?? address : address
+  if (!unbracketed.includes(':')) return unbracketed
+
+  const bare = unbracketed.split('%')[0] ?? unbracketed
+
+  // Embedded IPv4 in the last 32 bits: `::ffff:1.2.3.4`, `::1.2.3.4`, `64:ff9b::1.2.3.4`.
+  const v4 = /^(.*:)(\d{1,3}(?:\.\d{1,3}){3})$/.exec(bare)
+  if (v4) {
+    const octets = (v4[2] ?? '').split('.').map(Number)
+    if (octets.every((o) => o >= 0 && o <= 255)) return octets.join('.')
+    return bare
+  }
 
   const expanded = expandIpv6(bare)
   if (!expanded) return bare

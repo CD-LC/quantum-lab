@@ -37,6 +37,8 @@ import { reportError } from '@/lib/observability/report'
 import { sendEmail, type SendEmailInput, type SendResult } from '@/lib/email/client'
 import { courseDayEmail } from '@/lib/email/templates'
 import {
+  COURSE_DAY_MS,
+  COURSE_LENGTH_DAYS,
   dueCourseDay,
   normaliseSentDays,
   type CourseDay,
@@ -66,13 +68,27 @@ export type ClaimResult = { claimed: true; unsubscribeToken: string } | { claime
  * and nothing here may be exported in a way that skips that refusal.
  */
 export interface CourseDispatchStore {
-  listCandidates(limit: number): Promise<CourseCandidate[]>
+  /**
+   * Up to `limit` subscriptions that have a course day DUE at `now`, oldest
+   * confirmation first. A store MUST NOT return caught-up rows: the batch is
+   * bounded, so every slot a not-due row occupies is a due subscriber who
+   * gets nothing this pass (see courseDueFilter below for how that went wrong).
+   */
+  listCandidates(limit: number, now: Date): Promise<CourseCandidate[]>
   /**
    * Atomically append `day` to sent_days (and set the unsubscribe token if
    * the row has none yet). MUST refuse — claimed: false — when the day is
    * already present or the row has been unsubscribed since it was listed.
    */
   claimDay(candidate: CourseCandidate, day: CourseDay, freshToken: string): Promise<ClaimResult>
+  /**
+   * Take `day` back out of sent_days after the provider DEFINITIVELY refused
+   * the message (429 / 5xx, retries exhausted), so the next hourly pass sends
+   * it. Optional: a store without it keeps the claim, as before. MUST only
+   * remove `day` — never touch other days or the unsubscribe token — and MUST
+   * be a no-op on a row that no longer contains it.
+   */
+  releaseDay?(candidate: CourseCandidate, day: CourseDay): Promise<void>
 }
 
 // ── the Supabase implementation ─────────────────────────────────────────────
@@ -94,14 +110,53 @@ function client() {
   return supabase
 }
 
+/**
+ * The PostgREST `or` filter selecting exactly the rows with a course day due
+ * at `now` — the database-side twin of courseSchedule.dueCourseDay.
+ *
+ * ── Why this exists (RELIABILITY FIX) ───────────────────────────────────────
+ *
+ * The query used to list the `limit` OLDEST confirmed, not-finished rows and
+ * let runCourseDispatch work out which were due. A confirmed subscriber who is
+ * caught up (today's day already sent) is still "confirmed and not finished",
+ * so once more than `limit` people were mid-course the same oldest rows filled
+ * every batch, were all counted as notDue, and every newer subscriber received
+ * nothing until those finished day 7 — a confirmed learner could wait a week
+ * for day 1. Caught-up rows must therefore be excluded BY THE QUERY.
+ *
+ * ── The predicate ───────────────────────────────────────────────────────────
+ *
+ * PostgREST cannot compare a column against an expression of another column,
+ * so "confirmed_at <= now − cardinality(sent_days) days" is unrolled into one
+ * clause per course day:
+ *
+ *   day N is sendable  ⇔  N ∉ sent_days  AND  confirmed_at <= now − (N−1) days
+ *
+ * and a row is due iff ANY clause holds. This is exactly dueCourseDay ≠ null:
+ * if the lowest unsent day d is due, clause d holds; conversely, if clause N
+ * holds then the lowest unsent day is ≤ N and therefore also due, because
+ * N−1 days have already elapsed. courseDispatchStore.test.ts checks the two
+ * agree over a grid of rows. No schema change is needed — the filter runs on
+ * the columns the table already has.
+ */
+export function courseDueFilter(now: Date): string {
+  const clauses: string[] = []
+  for (let day = 1; day <= COURSE_LENGTH_DAYS; day += 1) {
+    const dueAt = new Date(now.getTime() - (day - 1) * COURSE_DAY_MS).toISOString()
+    clauses.push(`and(sent_days.not.cs.{${day}},confirmed_at.lte.${dueAt})`)
+  }
+  return clauses.join(',')
+}
+
 export const supabaseDispatchStore: CourseDispatchStore = {
   /**
-   * Oldest confirmations first, completed courses (day 7 sent) excluded by
-   * the `not cs {7}` filter. Confirmed-and-caught-up subscribers still occupy
-   * batch slots until their next day falls due — acceptable while the list is
-   * small; revisit with a due-date column if it ever is not.
+   * Only rows with a day due at `now` (courseDueFilter), oldest confirmation
+   * first, completed courses (day 7 sent) excluded by the `not cs {7}` filter.
+   * Because nothing caught-up is listed, `limit` bounds the number of
+   * MESSAGES a pass sends, and a backlog larger than `limit` drains across
+   * successive passes instead of starving the newest subscribers.
    */
-  async listCandidates(limit) {
+  async listCandidates(limit, now) {
     const { data, error } = await client()
       .from(SUBSCRIPTIONS_TABLE)
       .select(CANDIDATE_COLUMNS)
@@ -109,6 +164,7 @@ export const supabaseDispatchStore: CourseDispatchStore = {
       .not('confirmed_at', 'is', null)
       .is('unsubscribed_at', null)
       .not('sent_days', 'cs', '{7}')
+      .or(courseDueFilter(now))
       .order('confirmed_at', { ascending: true })
       .limit(limit)
     if (error) {
@@ -154,6 +210,29 @@ export const supabaseDispatchStore: CourseDispatchStore = {
     if (!row || !row.course_unsubscribe_token) return { claimed: false }
     return { claimed: true, unsubscribeToken: row.course_unsubscribe_token }
   },
+
+  /**
+   * Re-read the row and write back its sent_days without `day`, guarded on the
+   * value read so a concurrent claim of another day is not clobbered (a lost
+   * race leaves the claim in place, which is the old, safe behaviour).
+   */
+  async releaseDay(candidate, day) {
+    const db = client()
+    const { data, error } = await db
+      .from(SUBSCRIPTIONS_TABLE)
+      .select('sent_days')
+      .eq('id', candidate.id)
+      .maybeSingle()
+    if (error || !data) return
+    const current = normaliseSentDays((data as { sent_days: unknown }).sent_days)
+    if (!current.includes(day)) return
+    const next = current.filter((d) => d !== day)
+    await db
+      .from(SUBSCRIPTIONS_TABLE)
+      .update({ sent_days: next })
+      .eq('id', candidate.id)
+      .eq('sent_days', `{${current.join(',')}}`)
+  },
 }
 
 // ── token minting ───────────────────────────────────────────────────────────
@@ -179,12 +258,35 @@ export interface DispatchReport {
   /** Claims refused by the store — a concurrent run or a fresh opt-out. Not sent. */
   lostClaims: number
   /**
-   * Days CLAIMED but not delivered (provider refusal). The claim stands, so
-   * these are permanent gaps unless an operator intervenes — surfaced here
-   * precisely so they are an operator's problem and never a duplicate send.
+   * Days CLAIMED but not delivered (provider refusal). A definitive refusal
+   * (429 / 5xx after retries) is RELEASED (`released: true`) and goes out on
+   * the next pass; any other failure keeps the claim, so it is a permanent gap
+   * unless an operator intervenes — surfaced here precisely so it is an
+   * operator's problem and never a duplicate send.
    */
-  failures: { subscriptionId: string; day: number; reason: string }[]
+  failures: { subscriptionId: string; day: number; reason: string; released?: boolean }[]
+  /**
+   * Listed subscriptions this pass did NOT start because the wall-clock budget
+   * (DISPATCH_BUDGET_MS) was spent. Nothing was claimed for them; the next
+   * pass picks them up. Zero on a pass that finished the whole batch.
+   */
+  remaining: number
 }
+
+/**
+ * Wall-clock budget for one pass. The cron's curl gives up at 90 s and
+ * Cloudflare at about 100 s, while 100 paced sends alone take ~50 s plus the
+ * provider's latency and retries. Once this much time has passed no NEW send is
+ * started; a send already in flight finishes. Nothing is lost by stopping
+ * early: the stopped-on rows were never claimed, so the next hourly pass (or
+ * the immediate retry) sends them.
+ */
+export const DISPATCH_BUDGET_MS = 60_000
+
+/** Gap between provider calls: Resend's default limit is about 2 requests a second. */
+export const SEND_PACE_MS = 500
+/** Backoff before each retry of a definitively refused (429/5xx) send. */
+export const SEND_RETRY_BACKOFF_MS = [1_000, 3_000] as const
 
 export type SendFn = (input: SendEmailInput) => Promise<SendResult>
 
@@ -199,16 +301,41 @@ export async function runCourseDispatch(input: {
   now?: Date
   store?: CourseDispatchStore
   send?: SendFn
+  /** Injectable for tests; defaults to a real timer. */
+  sleep?: (ms: number) => Promise<void>
+  /** Wall-clock budget in ms before no new send is started. Defaults to DISPATCH_BUDGET_MS. */
+  budgetMs?: number
+  /** Injectable epoch-ms clock for the budget; defaults to Date.now. */
+  clock?: () => number
 }): Promise<DispatchReport> {
   const now = input.now ?? new Date()
   const store = input.store ?? supabaseDispatchStore
   const send = input.send ?? sendEmail
   const base = input.baseUrl.replace(/\/+$/, '')
+  const sleep = input.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
+  const clock = input.clock ?? Date.now
+  const budgetMs = input.budgetMs ?? DISPATCH_BUDGET_MS
+  const startedAt = clock()
+  let sentSomething = false
 
-  const report: DispatchReport = { examined: 0, sent: 0, notDue: 0, lostClaims: 0, failures: [] }
-  const candidates = await store.listCandidates(input.limit)
+  const report: DispatchReport = {
+    examined: 0,
+    sent: 0,
+    notDue: 0,
+    lostClaims: 0,
+    failures: [],
+    remaining: 0,
+  }
+  const candidates = await store.listCandidates(input.limit, now)
 
-  for (const candidate of candidates) {
+  for (let index = 0; index < candidates.length; index += 1) {
+    const candidate = candidates[index]
+    // Checked BEFORE the claim, never between a claim and its send: a claimed
+    // day must always reach the provider in this same iteration.
+    if (clock() - startedAt >= budgetMs) {
+      report.remaining = candidates.length - index
+      break
+    }
     report.examined += 1
     const day = dueCourseDay(candidate, now)
     if (day === null) {
@@ -228,17 +355,46 @@ export async function runCourseDispatch(input: {
       baseUrl: base,
       unsubscribeUrl: `${base}/api/email/unsubscribe/course?token=${claim.unsubscribeToken}`,
     })
-    const result = await send({
+    const message = {
       to: candidate.email,
       subject: content.subject,
       html: content.html,
       text: content.text,
-    })
+    }
+
+    // Pace the provider calls, and retry a DEFINITIVE refusal (429 / 5xx) a
+    // couple of times. An ambiguous failure (a thrown network error) is never
+    // retried or released: the provider may have accepted it.
+    if (sentSomething) await sleep(SEND_PACE_MS)
+    sentSomething = true
+    let result = await send(message)
+    for (const backoff of SEND_RETRY_BACKOFF_MS) {
+      if (result.sent || !result.retryable) break
+      await sleep(backoff)
+      result = await send(message)
+    }
+
     if (result.sent) {
       report.sent += 1
-    } else {
-      report.failures.push({ subscriptionId: candidate.id, day, reason: result.reason })
+      continue
     }
+    // Definitively refused after the retries: hand the day back so the next
+    // pass sends it, instead of leaving a permanent gap in the course.
+    let released = false
+    if (result.retryable && store.releaseDay) {
+      try {
+        await store.releaseDay(candidate, day)
+        released = true
+      } catch (err) {
+        reportError(err, { scope: 'email.dispatch', what: 'releaseDay' })
+      }
+    }
+    report.failures.push({
+      subscriptionId: candidate.id,
+      day,
+      reason: result.reason,
+      ...(released ? { released: true } : {}),
+    })
   }
 
   return report

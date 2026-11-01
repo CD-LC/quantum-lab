@@ -18,7 +18,8 @@
 
 import { READ_ROLES, bad, guard, jsonOk, orgIdFrom, rateLimit } from '@/lib/orgs/apiHelpers'
 import { getConsent, grantConsent, revokeConsent } from '@/lib/orgs/classroomStore'
-import { safeJson, isRecord } from '@/lib/security/validate'
+import { readJsonBody, isRecord } from '@/lib/security/validate'
+import { apiError } from '@/lib/apiError'
 import { reportError } from '@/lib/observability/report'
 
 export const runtime = 'nodejs'
@@ -50,7 +51,8 @@ export async function POST(req: Request): Promise<Response> {
   const limited = rateLimit(req, 'orgs-consent', 20)
   if (limited) return limited
 
-  const parsed = safeJson(await req.text(), 2_048)
+  const parsed = await readJsonBody(req, 2_048)
+  if (!parsed.ok && parsed.tooLarge) return apiError('payload_too_large')
   if (!parsed.ok) return bad(parsed.error, 400)
   if (!isRecord(parsed.value)) return bad('Expected a JSON object.', 400)
 

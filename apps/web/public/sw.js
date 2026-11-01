@@ -63,8 +63,30 @@ const APP_SHELL = ['/', '/offline', '/manifest.webmanifest', '/icons/icon.svg']
 /** How long a navigation may wait on the network before we serve from cache. */
 const NAVIGATION_TIMEOUT_MS = 3000
 
-/** Paths that must never be served from the cache — they are meaningless offline. */
+/**
+ * Paths that must never be served from the cache — they are meaningless offline,
+ * or they carry per-user / entitlement-gated data.
+ *
+ * `/api/` is every API route (tutor, billing, circuit sync, health).
+ *
+ * `/learn/<slug>/content` is the paid-lesson gate (app/learn/[slug]/content/route.ts):
+ * the paid blocks exist on the wire only in that response, only after the caller's
+ * entitlement was checked. It is not under /api/, so it used to fall through to the
+ * stale-while-revalidate handler, which stored the 200 in Cache Storage and served
+ * it first on every later request — after sign-out, after a subscription lapsed,
+ * and to the next person using the browser. Entitlement is decided by the server
+ * on every request or not at all.
+ */
 const NETWORK_ONLY_PREFIXES = ['/api/']
+const NETWORK_ONLY_PATTERNS = [/^\/learn\/[^/]+\/content\/?$/]
+
+/** True for a same-origin path whose response must never touch Cache Storage. */
+function isNetworkOnly(pathname) {
+  return (
+    NETWORK_ONLY_PREFIXES.some((prefix) => pathname.startsWith(prefix)) ||
+    NETWORK_ONLY_PATTERNS.some((pattern) => pattern.test(pathname))
+  )
+}
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
@@ -273,7 +295,7 @@ self.addEventListener('fetch', (event) => {
   // API routes back the AI tutor, billing and circuit sync. A stale answer here is
   // worse than no answer, so: network only, and a JSON 503 on failure so the calling
   // fetch() gets something it can parse instead of an HTML fallback page.
-  if (NETWORK_ONLY_PREFIXES.some((prefix) => url.pathname.startsWith(prefix))) {
+  if (isNetworkOnly(url.pathname)) {
     event.respondWith(fetch(request).catch(() => offlineJsonResponse()))
     return
   }

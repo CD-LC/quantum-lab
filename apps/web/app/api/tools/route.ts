@@ -25,7 +25,7 @@
 import { NextResponse } from 'next/server'
 import { apiError, badRequest } from '@/lib/apiError'
 import { callerKey, rateLimit, retryAfterHeaders, type RateLimitRule } from '@/lib/rateLimit'
-import { isRecord, safeJson, str } from '@/lib/security/validate'
+import { isRecord, readJsonBody, str } from '@/lib/security/validate'
 import { callTool, getTool } from '@/lib/mcp/server'
 
 export const runtime = 'nodejs'
@@ -62,7 +62,8 @@ export async function POST(req: Request): Promise<Response> {
   const limited = await rateLimit(callerKey(req.headers, 'tools'), TOOLS_LIMIT)
   if (!limited.allowed) return apiError('rate_limited', { headers: retryAfterHeaders(limited) })
 
-  const parsed = safeJson(await req.text(), MAX_BODY_BYTES)
+  const parsed = await readJsonBody(req, MAX_BODY_BYTES)
+  if (!parsed.ok && parsed.tooLarge) return apiError('payload_too_large')
   if (!parsed.ok) return badRequest(parsed.error)
   if (!isRecord(parsed.value)) return badRequest('Expected a JSON object: {"tool": string, "args": object}.')
 

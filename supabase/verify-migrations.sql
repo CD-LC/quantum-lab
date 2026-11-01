@@ -103,3 +103,45 @@ from pg_policy pol
 join pg_class c on c.oid = pol.polrelid
 join pg_namespace n on n.oid = c.relnamespace
 where n.nspname = 'public' and c.relname = 'circuits' and pol.polname = 'circuits_insert_own';
+
+-- ============================================================
+-- Audit 2026-10-22: no SECURITY DEFINER function in public may be
+-- executable by anon or authenticated unless it is on the short
+-- allow-list of helpers that RLS policies call (is_org_member and
+-- is_org_manager read only the caller's own memberships). Must
+-- return zero rows. spend_in_window, estimated_job_cost_usd and
+-- reserve_hardware_job* are service_role only.
+-- ============================================================
+select
+  p.oid::regprocedure                          as should_not_be_callable,
+  has_function_privilege('anon', p.oid, 'execute')          as anon_can_execute,
+  has_function_privilege('authenticated', p.oid, 'execute') as authenticated_can_execute
+from pg_proc p
+join pg_namespace n on n.oid = p.pronamespace
+where n.nspname = 'public'
+  and p.prosecdef
+  and p.proname not in ('is_org_member', 'is_org_manager')
+  and (has_function_privilege('anon', p.oid, 'execute')
+       or has_function_privilege('authenticated', p.oid, 'execute'));
+
+-- ============================================================
+-- Audit 2026-10-22: the org_invites update policy must be
+-- manager-only and the seat-cap and invite-lock triggers present.
+-- Every row should read 'OK'.
+-- ============================================================
+select 'org_invites_lock_identity trigger' as check_name,
+       case when exists (select 1 from pg_trigger where tgname = 'org_invites_lock_identity' and not tgisinternal)
+            then 'OK' else 'MISSING' end as status
+union all
+select 'org_members_enforce_seat_cap trigger',
+       case when exists (select 1 from pg_trigger where tgname = 'org_members_enforce_seat_cap' and not tgisinternal)
+            then 'OK' else 'MISSING' end
+union all
+select 'org_invites update policy is manager-only',
+       case when exists (
+         select 1 from pg_policies
+          where schemaname = 'public' and tablename = 'org_invites'
+            and policyname = 'org_invites_update_manager'
+            and coalesce(qual, '') not like '%jwt%'
+            and coalesce(with_check, '') not like '%jwt%')
+            then 'OK' else 'REGRESSED: re-run 20261022000040' end;

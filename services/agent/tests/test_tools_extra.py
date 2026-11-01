@@ -299,6 +299,53 @@ def test_recommend_prefers_revision_over_advancing() -> None:
 # --------------------------------------------------------------------------- #
 
 
+class _FakeStream:
+    """A stand-in for the ``httpx.stream`` context manager."""
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = chunks
+        self.chunks_read = 0
+
+    def __enter__(self) -> "_FakeStream":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def iter_bytes(self):  # type: ignore[no-untyped-def]
+        for chunk in self._chunks:
+            self.chunks_read += 1
+            yield chunk
+
+
+def test_fetch_arxiv_uses_https_everywhere() -> None:
+    """The API endpoint and the fallback PDF link are not cleartext."""
+    assert arxiv.ARXIV_API_URL.startswith("https://")
+    entry = arxiv.ET.fromstring(
+        '<entry xmlns="http://www.w3.org/2005/Atom"><id>http://arxiv.org/abs/2401.00001v1</id>'
+        "<title>T</title></entry>"
+    )
+    assert arxiv._parse_entry(entry)["pdf_url"].startswith("https://arxiv.org/pdf/")
+
+
+def test_fetch_arxiv_caps_the_response_while_streaming(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An oversized body is refused before the rest of it is read."""
+    import httpx
+
+    big = [b"x" * 100_000 for _ in range(50)]
+    stream = _FakeStream(big)
+    monkeypatch.setattr(httpx, "stream", lambda *a, **k: stream)
+
+    result = arxiv.fetch_paper("2401.12345")
+
+    assert "error" in result and "cap" in result["error"]
+    # 512 KiB cap / 100 kB chunks: stopped after 6 chunks, not 50.
+    assert stream.chunks_read <= 6
+
+
 def test_fetch_arxiv_unreachable_host_returns_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """A dead endpoint yields {error}, never an exception."""
     monkeypatch.setattr(arxiv, "ARXIV_API_URL", "http://127.0.0.1:9/api/query")
@@ -318,7 +365,7 @@ def test_fetch_arxiv_transport_failure_is_caught(monkeypatch: pytest.MonkeyPatch
     def boom(*_args: object, **_kwargs: object) -> None:
         raise httpx.ConnectTimeout("simulated timeout")
 
-    monkeypatch.setattr(httpx, "get", boom)
+    monkeypatch.setattr(httpx, "stream", boom)
 
     result = arxiv.fetch_paper("https://arxiv.org/abs/2401.12345")
     assert "error" in result
@@ -352,20 +399,14 @@ def test_fetch_arxiv_parses_a_canned_response(monkeypatch: pytest.MonkeyPatch) -
   </entry>
 </feed>"""
 
-    class FakeResponse:
-        text = atom
-
-        def raise_for_status(self) -> None:
-            return None
-
     captured: dict[str, object] = {}
 
-    def fake_get(url: str, **kwargs: object) -> FakeResponse:
+    def fake_stream(method: str, url: str, **kwargs: object) -> _FakeStream:
         captured["url"] = url
         captured["headers"] = kwargs.get("headers")
-        return FakeResponse()
+        return _FakeStream([atom.encode("utf-8")])
 
-    monkeypatch.setattr(httpx, "get", fake_get)
+    monkeypatch.setattr(httpx, "stream", fake_stream)
 
     result = _fetch_arxiv_paper_impl("1234.56789")
 

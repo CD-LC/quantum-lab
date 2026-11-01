@@ -37,7 +37,7 @@ import {
   confirmSubscriptionByToken,
 } from '@/lib/email/subscriptions'
 import { APP_URL } from '@/lib/billing/stripe'
-import { email as validEmail, safeJson, isRecord } from '@/lib/security/validate'
+import { email as validEmail, readJsonBody, isRecord } from '@/lib/security/validate'
 import { callerKey, rateLimit, retryAfterHeaders } from '@/lib/rateLimit'
 import type { ApiErrorBody } from '@/lib/apiError'
 
@@ -49,6 +49,8 @@ export const runtime = 'nodejs'
 // sending reputation, addressed to someone who may not have asked.
 const MAX_PER_MINUTE = 3
 const MAX_PER_DAY = 10
+/** Confirm mails any one mailbox may be sent per day, from any number of callers. */
+const MAX_PER_ADDRESS_PER_DAY = 2
 
 /** The identical body for every accepted POST — see the header for why. */
 const ACCEPTED = {
@@ -89,12 +91,29 @@ export async function POST(request: Request): Promise<NextResponse> {
     })
   }
 
-  const parsed = safeJson(await request.text(), 4_096)
+  const parsed = await readJsonBody(request, 4_096)
+  if (!parsed.ok && parsed.tooLarge) {
+    const body: ApiErrorBody = { error: parsed.error, code: 'payload_too_large' }
+    return NextResponse.json(body, { status: 413 })
+  }
   if (!parsed.ok) return bad(parsed.error)
   if (!isRecord(parsed.value)) return bad('Expected an object of the shape { email }.')
 
   const address = validEmail(parsed.value.email)
   if (!address.ok) return bad(address.error)
+
+  // Per-RECIPIENT throttle. The per-IP limits above bound one machine; they do
+  // nothing about many machines aimed at one mailbox, or about someone
+  // re-submitting an address that unsubscribed (a re-signup replaces the row
+  // and mails a fresh confirm). The shared limiter is keyed on the address, so
+  // a given mailbox gets at most MAX_PER_ADDRESS_PER_DAY confirm mails a day
+  // whoever asks. Over the cap the response is the SAME ACCEPTED body and
+  // nothing happens — no new token, no mail — so this is not an oracle either.
+  const perAddress = await rateLimit(`email-subscribe-to:${address.value.toLowerCase()}`, {
+    limit: MAX_PER_ADDRESS_PER_DAY,
+    windowMs: 86_400_000,
+  })
+  if (!perAddress.allowed) return NextResponse.json(ACCEPTED)
 
   try {
     const outcome = await beginSubscription(address.value, 'course-7day')
@@ -111,7 +130,12 @@ export async function POST(request: Request): Promise<NextResponse> {
       // the response differ between "mail attempted" and "already confirmed,
       // nothing sent", which is the oracle this route refuses to be. With no
       // provider key the message lands in the dev console (lib/email/client.ts).
-      await sendEmail({
+      //
+      // TIMING: the send is not awaited. Awaiting it made a fresh or unconfirmed
+      // address answer hundreds of milliseconds slower than an already-confirmed
+      // one (which sends nothing), a probe for who is subscribed. sendEmail
+      // never throws, so detaching it cannot produce an unhandled rejection.
+      void sendEmail({
         to: address.value,
         subject: content.subject,
         html: content.html,
@@ -156,8 +180,8 @@ export async function GET(request: Request): Promise<NextResponse> {
         return page(
           'You are signed up',
           'Your address is confirmed for the 7-day Qubit16 email course. ' +
-            'Every message will carry a one-click unsubscribe link. ' +
-            '(Sending is not switched on yet — you will not receive anything before it is.)'
+            'Day 1 arrives with the next hourly send, then one lesson a day for a week. ' +
+            'Every message carries a one-click unsubscribe link.'
         )
       case 'already-confirmed':
         return page('Already confirmed', 'This signup was already confirmed. Nothing changed.')

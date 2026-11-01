@@ -21,13 +21,16 @@ secret gate (app/core/security.py) — a liveness probe cannot be handed a secre
 
 from __future__ import annotations
 
+import hmac
 import os
+import threading
 import time
 from typing import Any, Literal
 
-from fastapi import APIRouter, Response
+from fastapi import APIRouter, Request, Response
 
 from app import __version__
+from app.core.security import SHARED_SECRET_HEADER, accepted_secrets
 from app.jobs import queue
 from app.quantum.backends import list_backends
 
@@ -216,31 +219,108 @@ def _overall(checks: dict[str, dict[str, Any]]) -> str:
     return "ok"
 
 
-@router.get("/api/health")
-def health(response: Response) -> dict[str, Any]:
-    """Report status, version and what this service can actually reach.
+#: How long a computed report is reused. /api/health is exempt from the shared
+#: secret (a liveness probe cannot hold one) and is reachable by anyone who has
+#: the hostname, so each call used to run a simulator circuit and ping the job
+#: store: an unthrottled CPU amplifier on a 0.25 vCPU single replica. Within the
+#: window every caller gets the stored report, so anonymous load costs O(1). The
+#: container HEALTHCHECK polls every 30 s, so a healthy report is never stale to
+#: it; a ``failing`` report is kept far shorter so recovery is seen quickly.
+HEALTH_CACHE_SECONDS = 15.0
+HEALTH_FAILING_CACHE_SECONDS = 2.0
 
-    Returns:
-        A dictionary with ``status``, ``version``, ``qiskit_version``,
-        ``backends_available`` and a ``checks`` map. Sets HTTP 503 when
-        ``status`` is ``failing``; ``degraded`` stays 200 deliberately, because
-        paging on a caveat teaches people to ignore the page.
-    """
+_cache_lock = threading.Lock()
+_cache: tuple[float, float, int, dict[str, Any]] | None = None  # (stamp, ttl, code, body)
+
+
+def _reset_cache() -> None:
+    """Drop the stored report (tests, and anything that wants a fresh probe)."""
+    global _cache
+    with _cache_lock:
+        _cache = None
+
+
+def _build_report() -> tuple[int, dict[str, Any]]:
+    """Run every probe once and return ``(http_status, body)``."""
     checks = {
         "simulator": _probe_simulator(),
         "jobStore": _probe_job_store(),
         "hardware": _probe_hardware(),
     }
     status = _overall(checks)
-    if status == "failing":
-        response.status_code = 503
-    # A cached health report is a lie that never changes.
-    response.headers["cache-control"] = "no-store, no-cache, must-revalidate"
+    return (
+        503 if status == "failing" else 200,
+        {
+            "status": status,
+            "version": __version__,
+            "backends_available": [b.id for b in list_backends() if b.available],
+            "qiskit_version": _qiskit_version(),
+            "checks": checks,
+        },
+    )
 
-    return {
-        "status": status,
-        "version": __version__,
-        "backends_available": [b.id for b in list_backends() if b.available],
-        "qiskit_version": _qiskit_version(),
-        "checks": checks,
+
+def _has_shared_secret(request: Request) -> bool:
+    """True when the caller presented a currently-accepted shared secret.
+
+    ``/api/health`` is exempt from the gate (a liveness probe holds no secret),
+    so this decides only how much DETAIL the caller gets, never whether it gets
+    an answer. With no secret configured nobody can present one, so everyone
+    gets the trimmed report.
+    """
+    presented = request.headers.get(SHARED_SECRET_HEADER, "")
+    matched = False
+    for candidate in accepted_secrets():
+        # Every candidate compared, no early exit: see the gate in security.py.
+        if hmac.compare_digest(presented, candidate):
+            matched = True
+    return matched
+
+
+def _public_view(body: dict[str, Any]) -> dict[str, Any]:
+    """Strip what an anonymous caller could use to fingerprint this deployment.
+
+    Kept: ``status`` (the liveness contract), ``version`` and, per probe,
+    ``status`` / ``checked`` / ``ms``. Dropped: the Qiskit version, the list of
+    configured backends (it reveals which hardware providers have credentials)
+    and each probe's free-text ``detail`` (it names the job-store backend and
+    hardware providers).
+    """
+    checks = {
+        name: {k: v for k, v in check.items() if k != "detail"}
+        for name, check in body["checks"].items()
     }
+    return {"status": body["status"], "version": body["version"], "checks": checks}
+
+
+@router.get("/api/health")
+def health(request: Request, response: Response) -> dict[str, Any]:
+    """Report status, version and what this service can actually reach.
+
+    The report is computed at most once per :data:`HEALTH_CACHE_SECONDS` (see
+    there); concurrent callers wait for the one computation rather than each
+    running a circuit.
+
+    Returns:
+        With a valid shared secret: ``status``, ``version``, ``qiskit_version``,
+        ``backends_available`` and a ``checks`` map with probe details. Without
+        one: ``status``, ``version`` and per-probe ``status``/``checked``/``ms``
+        only. Sets HTTP 503 when ``status`` is ``failing``; ``degraded`` stays
+        200 deliberately, because paging on a caveat teaches people to ignore
+        the page.
+    """
+    global _cache
+    with _cache_lock:
+        now = time.monotonic()
+        if _cache is not None and now - _cache[0] < _cache[1]:
+            code, body = _cache[2], _cache[3]
+        else:
+            code, body = _build_report()
+            ttl = HEALTH_FAILING_CACHE_SECONDS if code != 200 else HEALTH_CACHE_SECONDS
+            _cache = (time.monotonic(), ttl, code, body)
+    if code != 200:
+        response.status_code = code
+    # Client and proxy caches stay off: the server-side window above is the only
+    # reuse, and it is short enough that a downstream cache would only add lag.
+    response.headers["cache-control"] = "no-store, no-cache, must-revalidate"
+    return body if _has_shared_secret(request) else _public_view(body)

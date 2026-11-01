@@ -191,10 +191,11 @@ test.describe('certification exam', () => {
     await expect(page.getByRole('region', { name: /question review/i })).toBeVisible()
     await expect(timer(page)).toHaveCount(0)
 
-    // A retake is a deliberate act, and it deals a new paper.
-    await page.getByRole('button', { name: /^Retake exam$/ }).click()
-    await waitForPaper(page)
-    await expect(page.getByText(`0 / ${EXAM.questionCount} answered`)).toBeVisible()
+    // After a paper that did not pass the server makes the next one wait (the
+    // review shows the answer key, so an instant retake would harvest the
+    // bank). The button says so up front instead of leading to an error page.
+    await expect(page.getByRole('button', { name: /^Retake exam$/ })).toBeDisabled()
+    await expect(page.getByText(/you can sit again from/i)).toBeVisible()
   })
 
   test('an anonymous pass is graded but not certified', async ({ page }) => {

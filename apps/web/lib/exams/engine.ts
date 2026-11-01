@@ -116,14 +116,40 @@ export function toPaperQuestion(q: ExamQuestion): PaperQuestion {
   return paper
 }
 
-/** The post-submission view: the paper question plus its key and verdict. */
+/**
+ * True when the candidate gave something gradeable for this graded item.
+ * `given` is what `gradeQuestion` saw: a number or null for numeric, the
+ * selected ids (possibly none) for everything else.
+ */
+export function wasAnswered(g: GradedQuestion): boolean {
+  if (g.given === null) return false
+  if (Array.isArray(g.given)) return g.given.length > 0
+  return Number.isFinite(g.given)
+}
+
+/**
+ * The post-submission view: the paper question plus its verdict, and — ONLY
+ * for a question the candidate actually answered — its key and explanation.
+ *
+ * The condition is the fix for an answer-bank harvest. Before it, the review
+ * carried the key for every item on the paper regardless of whether it was
+ * attempted, so `start → submit {}` ten times a minute (the start limit) read
+ * out the whole bank in about ten minutes with no account at all. Now a blank
+ * item reveals nothing; a candidate who wants to learn the answer to a
+ * question has to commit an answer to it, and a wrong one still costs them the
+ * retake cooldown in service.ts. A genuinely sat paper is unaffected: every
+ * question the candidate answered gets its full review, pass or fail.
+ */
 export function toReviewQuestion(g: GradedQuestion): ReviewQuestion {
+  const answered = wasAnswered(g)
   const review: ReviewQuestion = {
     ...toPaperQuestion(g.question),
     correct: g.correct,
     earned: g.earned,
-    explanation: g.question.explanation,
+    answered,
   }
+  if (!answered) return review
+  review.explanation = g.question.explanation
   if (g.question.correctIds) review.correctIds = [...g.question.correctIds]
   if (g.question.correctNumber !== undefined) review.correctNumber = g.question.correctNumber
   if (g.question.tolerance !== undefined) review.tolerance = g.question.tolerance

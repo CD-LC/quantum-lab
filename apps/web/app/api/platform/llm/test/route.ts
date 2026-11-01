@@ -4,11 +4,16 @@ import { createAnthropic } from '@ai-sdk/anthropic'
 import { createAzure } from '@ai-sdk/azure'
 import { createGoogleGenerativeAI } from '@ai-sdk/google'
 import { createGroq } from '@ai-sdk/groq'
-import { badRequest } from '@/lib/apiError'
-import { isRecord, safeJson } from '@/lib/security/validate'
+import { badRequest, apiError } from '@/lib/apiError'
+import { isRecord, readJsonBody } from '@/lib/security/validate'
 import { guardPlatformAdmin } from '@/lib/platform/routeGuard'
 import { effectiveLlmSettings, invalidateLlmSettings } from '@/lib/platform/settings'
-import { isProviderId, providerModel, providerReady } from '@/lib/platform/llmConfig'
+import {
+  isAllowedProviderBaseUrl,
+  isProviderId,
+  providerModel,
+  providerReady,
+} from '@/lib/platform/llmConfig'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -25,7 +30,8 @@ const TEST_TIMEOUT_MS = 15_000
 export async function POST(req: Request): Promise<Response> {
   const guard = await guardPlatformAdmin(req, 'platform-llm-test', 10)
   if (!guard.ok) return guard.response
-  const parsed = safeJson(await req.text(), 8_000)
+  const parsed = await readJsonBody(req, 8_000)
+  if (!parsed.ok && parsed.tooLarge) return apiError('payload_too_large')
   if (!parsed.ok) return badRequest(parsed.error)
   if (!isRecord(parsed.value) || !isProviderId(parsed.value.provider)) {
     return badRequest('Body must name a provider: gemini, groq, anthropic or azure.')
@@ -37,7 +43,26 @@ export async function POST(req: Request): Promise<Response> {
   const str = (v: unknown, max: number) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, max) : '')
   if (str(parsed.value.apiKey, 512)) cfg.apiKey = str(parsed.value.apiKey, 512)
   if (str(parsed.value.model, 120)) cfg.model = str(parsed.value.model, 120)
-  if (str(parsed.value.baseUrl, 400)) cfg.baseUrl = str(parsed.value.baseUrl, 400)
+  const suppliedBaseUrl = str(parsed.value.baseUrl, 400)
+  if (id !== 'azure') {
+    // Only Azure takes a base URL; the other SDKs use fixed endpoints.
+    cfg.baseUrl = ''
+  } else if (suppliedBaseUrl) {
+    // The key goes to this URL. Only a provider host is acceptable, and a URL
+    // that differs from the saved one never borrows the saved/env key: the
+    // admin must type the key too, so the server-held secret cannot be pointed
+    // at a host of the caller's choosing.
+    if (!isAllowedProviderBaseUrl(id, suppliedBaseUrl)) {
+      return badRequest('baseUrl must be an https URL on an allowed provider host (for Azure, *.openai.azure.com).')
+    }
+    if (suppliedBaseUrl !== cfg.baseUrl && !str(parsed.value.apiKey, 512)) {
+      return badRequest('Testing a different endpoint needs an API key in the request; the saved key is not sent to a new URL.')
+    }
+    cfg.baseUrl = suppliedBaseUrl
+  } else if (cfg.baseUrl && !isAllowedProviderBaseUrl(id, cfg.baseUrl)) {
+    // A value saved before the allowlist existed.
+    return badRequest('The saved baseUrl is not an allowed provider host. Correct it in the settings first.')
+  }
   if (str(parsed.value.apiVersion, 64)) cfg.apiVersion = str(parsed.value.apiVersion, 64)
   if (!providerReady(id, cfg)) {
     return NextResponse.json(

@@ -42,8 +42,13 @@ const state: {
   invite: OrgInvite | null
   /** ids of invites markInviteAccepted has burned. */
   burned: Set<string>
+  /** Seats claimed through claimSeat: the held seat made active and bound. */
   addedMembers: { orgId: string; email: string; role: string; status: string }[]
-} = { tokens: new Map(), invite: null, burned: new Set(), addedMembers: [] }
+  /** The seats the org holds (the 'invited' row an admin minted with the link). */
+  members: { id: string; orgId: string; email: string; role: string; status: string }[]
+  /** Set to make claimSeat fail, to prove a failed claim does not burn the link. */
+  claimFails: boolean
+} = { tokens: new Map(), invite: null, burned: new Set(), addedMembers: [], members: [], claimFails: false }
 
 vi.mock('@/lib/supabase', () => ({
   isSupabaseConfigured: true,
@@ -74,7 +79,7 @@ vi.mock('@/lib/orgs/store', () => ({
   },
   getOrg: async (orgId: string) => ({ id: orgId, name: 'Acme', seatsTotal: 25 }),
   seatUsage: async () => ({ used: 1, total: 25, available: 24 }),
-  listMembers: async () => [],
+  listMembers: async () => state.members,
   markInviteAccepted: async (id: string) => {
     // Single use, modelled the way the real conditional update behaves: the
     // first caller wins, every later one is told no.
@@ -82,11 +87,14 @@ vi.mock('@/lib/orgs/store', () => ({
     state.burned.add(id)
     return true
   },
-  addMember: async (orgId: string, email: string, role: string, status: string) => {
-    state.addedMembers.push({ orgId, email, role, status })
-    return { id: 'm-new', orgId, userId: '', email, role, status, joinedAt: 'now' }
+  claimSeat: async (orgId: string, memberId: string, userId: string) => {
+    if (state.claimFails) return null
+    const seat = state.members.find((m) => m.id === memberId)
+    if (!seat) return null
+    state.addedMembers.push({ orgId, email: seat.email, role: seat.role, status: 'active' })
+    return { ...seat, status: 'active', userId, joinedAt: 'now' }
   },
-  setMemberStatus: async () => null,
+  releaseInvite: async (id: string) => state.burned.delete(id),
   isSeatLimitError: () => false,
 }))
 
@@ -123,6 +131,10 @@ beforeEach(() => {
   state.invite = null
   state.burned = new Set()
   state.addedMembers = []
+  state.members = [
+    { id: 'm-held', orgId: ORG, email: 'invited@acme.test', role: 'member', status: 'invited' },
+  ]
+  state.claimFails = false
 })
 
 /** Mint a live invite for invited@acme.test and install it as the stored row. */
@@ -234,6 +246,34 @@ describe('POST /api/orgs/invite/accept', () => {
     expect(state.addedMembers[0].orgId).toBe(ORG)
   })
 
+  it('refuses a link whose seat was removed, so a revoked invite stays revoked', async () => {
+    const token = await liveInvite()
+    state.members = []
+    const res = await accept.POST(post({ token }, 'tok-invitee'))
+    expect(res.status).toBe(404)
+    expect(state.addedMembers).toHaveLength(0)
+    expect(state.burned.size).toBe(0)
+  })
+
+  it('refuses a link whose seat was suspended', async () => {
+    const token = await liveInvite()
+    state.members = state.members.map((m) => ({ ...m, status: 'suspended' }))
+    const res = await accept.POST(post({ token }, 'tok-invitee'))
+    expect(res.status).toBe(404)
+    expect(state.addedMembers).toHaveLength(0)
+  })
+
+  it('un-burns the link when the claim fails, so the invitee can retry', async () => {
+    const token = await liveInvite()
+    state.claimFails = true
+    const failed = await accept.POST(post({ token }, 'tok-invitee'))
+    expect(failed.status).toBe(500)
+    expect(state.burned.size).toBe(0)
+    state.claimFails = false
+    const retry = await accept.POST(post({ token }, 'tok-invitee'))
+    expect(retry.status).toBe(200)
+  })
+
   it('is single use — the second claim fails', async () => {
     const token = await liveInvite()
     expect((await accept.POST(post({ token }, 'tok-invitee'))).status).toBe(200)
@@ -268,6 +308,28 @@ describe('POST /api/orgs/invite/accept', () => {
 
   it('bounds a junk token without hashing it', async () => {
     const res = await accept.POST(post({ token: 'x'.repeat(5000) }, 'tok-invitee'))
-    expect(res.status).toBe(400)
+    // 5000 bytes is over the route's 4 KiB body cap: refused while reading.
+    expect(res.status).toBe(413)
+  })
+})
+
+describe('mailSafeOrgName', () => {
+  it('leaves an ordinary name alone', async () => {
+    const { mailSafeOrgName } = await import('@/lib/orgs/invites')
+    expect(mailSafeOrgName('Acme Physics Dept')).toBe('Acme Physics Dept')
+  })
+
+  it('strips URLs, domains, emails and phone numbers', async () => {
+    const { mailSafeOrgName } = await import('@/lib/orgs/invites')
+    expect(mailSafeOrgName('Claim your prize at https://evil.example/x now')).toBe('Claim your prize at now')
+    expect(mailSafeOrgName('Visit evil-site.com today')).toBe('Visit today')
+    expect(mailSafeOrgName('Call +1 (555) 123-4567 or mail a@b.co')).toBe('Call or mail')
+    expect(mailSafeOrgName('x'.repeat(200)).length).toBeLessThanOrEqual(60)
+  })
+
+  it('falls back when nothing is left', async () => {
+    const { mailSafeOrgName } = await import('@/lib/orgs/invites')
+    expect(mailSafeOrgName('https://evil.example')).toBe('an organisation')
+    expect(mailSafeOrgName('\n\t')).toBe('an organisation')
   })
 })

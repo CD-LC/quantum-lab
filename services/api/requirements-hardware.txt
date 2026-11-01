@@ -30,15 +30,15 @@
 # account IBM_QUANTUM_INSTANCE (the CRN) — see app/core/config.py.
 # >=0.40 for the ibm_quantum_platform channel; the legacy ibm_quantum channel
 # it replaced was retired in 2025 and a token alone no longer addresses a job.
-qiskit-ibm-runtime>=0.40
+qiskit-ibm-runtime>=0.40,<1
 
 # IonQ and Rigetti via Amazon Braket. Needs AWS credentials and
 # BRAKET_S3_BUCKET.
-amazon-braket-sdk>=1.90
+amazon-braket-sdk>=1.90,<2
 
 # Quantinuum and IonQ via Azure Quantum. Needs AZURE_QUANTUM_RESOURCE_ID and
 # AZURE_QUANTUM_LOCATION.
-azure-quantum>=2.0
+azure-quantum>=2.0,<4
 
 # Service-principal authentication, for BYOK on Azure (docs/BYOK.md §4).
 #
@@ -56,4 +56,4 @@ azure-quantum>=2.0
 # The operator path does NOT need this: with no BYOK credential the SDK builds
 # its own DefaultAzureCredential internally. Only a user-supplied service
 # principal reaches the direct import.
-azure-identity>=1.17
+azure-identity>=1.17,<2

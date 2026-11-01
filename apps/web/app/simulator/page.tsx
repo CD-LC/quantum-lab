@@ -20,7 +20,8 @@ import {
   emptyCircuit,
   fromQasm,
   run,
-  simulateSteps,
+  simulateStepsChecked,
+  StateVector,
   toQasm,
   type Circuit,
   type GateName,
@@ -142,6 +143,7 @@ export default function SimulatorPage() {
   /** Qubit count the user asked for but their plan does not allow. */
   const [upsellQubits, setUpsellQubits] = useState<number | null>(null)
   const [loadNotice, setLoadNotice] = useState<string | null>(null)
+  const [runError, setRunError] = useState<string | null>(null)
   const [qasmNotice, setQasmNotice] = useState<string | null>(null)
   const sharedAppliedRef = useRef(false)
   // 'qasm' for exactly one circuit-change cycle right after the QASM pane
@@ -162,13 +164,36 @@ export default function SimulatorPage() {
   // (median 51.5ms over 10 runs, Node 22 / Float64Array), and a placement is
   // a discrete click, not a stream of input. Re-measure before adding gates
   // wider than the 16-qubit plan ceiling.
-  const frames = useMemo(() => simulateSteps(circuit), [circuit])
+  //
+  // This runs during render, so it must never throw: a POSTSELECT that cannot
+  // happen (placed on a |0⟩ wire, or arriving in a share link) comes back as a
+  // notice with the state frozen at that step, and anything unexpected falls
+  // back to the blank register plus the error text, instead of reaching
+  // error.tsx and discarding the learner's circuit.
+  const stepsResult = useMemo(() => {
+    try {
+      return simulateStepsChecked(circuit)
+    } catch (e) {
+      const blank = new StateVector(Math.min(16, Math.max(1, Math.trunc(circuit.numQubits) || 1)))
+      return {
+        frames: [blank],
+        finalState: blank,
+        notice: e instanceof Error ? e.message : 'This circuit could not be simulated.',
+      }
+    }
+  }, [circuit])
+  const { frames, finalState, notice: simNotice } = stepsResult
+  // `frames` can be a PREFIX of the circuit's steps (a long circuit on a wide
+  // register keeps only so many), so frames[last] is the final state only when
+  // nothing was cut. Anything at or past the last gate reads finalState, which
+  // is always exact; a step in the cut-off range (the transport does not offer
+  // one) clamps to the last kept frame rather than reading off the end.
   const displayState = useMemo(
     () =>
-      stepIndex === null
-        ? frames[frames.length - 1]
-        : frames[Math.min(stepIndex, frames.length - 1)],
-    [frames, stepIndex]
+      stepIndex === null || stepIndex >= circuit.ops.length
+        ? finalState
+        : frames[Math.min(Math.max(stepIndex, 0), frames.length - 1)],
+    [circuit.ops.length, frames, finalState, stepIndex]
   )
   const qasm = useMemo(() => toQasm(circuit), [circuit])
 
@@ -225,12 +250,22 @@ export default function SimulatorPage() {
       setCircuit(c)
       setStepIndex(null)
       setResult(null)
+      setRunError(null)
     },
     [setCircuit]
   )
 
   const handleRun = useCallback(() => {
-    setResult(run(circuit, parseInt(shots, 10), noise))
+    // run() throws for a circuit with no defined outcome (every POSTSELECT
+    // impossible). Say so in the page rather than failing silently.
+    try {
+      setResult(run(circuit, parseInt(shots, 10), noise))
+      setRunError(null)
+    } catch (e) {
+      setResult(null)
+      setRunError(e instanceof Error ? e.message : 'This circuit could not be run.')
+      return
+    }
     // 'circuit.built' fires here (and on Step) rather than on every gate
     // placement: running is the first evidence a composed circuit was meant.
     // The emitter dedups per session per circuit shape, so re-running the same
@@ -620,6 +655,7 @@ export default function SimulatorPage() {
             // Same memo the inspector reads — the grid's inline column probe
             // is a lookup into these frames, never a second simulation.
             frames={frames}
+            finalState={finalState}
           />
         </section>
       </div>
@@ -695,6 +731,17 @@ export default function SimulatorPage() {
           {preset ? <p className="mt-1.5 text-[11px] text-ink-muted">{preset.blurb}</p> : null}
         </div>
 
+        {simNotice ? (
+          <p className="w-full text-xs text-q-amber-text" role="status">
+            {simNotice}
+          </p>
+        ) : null}
+        {runError ? (
+          <p className="w-full text-xs text-q-rose-text" role="alert">
+            {runError}
+          </p>
+        ) : null}
+
         {loadNotice ? (
           <p className="w-full text-xs text-q-amber-text" role="status">
             {loadNotice}{' '}
@@ -727,6 +774,15 @@ export default function SimulatorPage() {
                   unit="shots"
                 />
               )}
+              {result.approximate ? (
+                // Mid-circuit measurement past what can be enumerated exactly:
+                // say the chart is an estimate instead of presenting it as exact.
+                <p className="mt-3 text-xs text-q-amber-text" role="status">
+                  Estimate: this circuit measures and branches too much to enumerate exactly, so
+                  these outcomes are averaged over {result.trajectories?.toLocaleString('en-US')}{' '}
+                  sampled runs. Measuring only at the end of the circuit is always exact.
+                </p>
+              ) : null}
               <div className="mt-4">
                 <Toggle label="Show as table" checked={showTable} onChange={setShowTable} />
               </div>
@@ -747,6 +803,7 @@ export default function SimulatorPage() {
           <StepInspector
             circuit={circuit}
             frames={frames}
+            finalState={finalState}
             step={stepIndex}
             onStepChange={handleStepChange}
           />
@@ -842,7 +899,7 @@ export default function SimulatorPage() {
 
       <ResearchPanel
         circuit={circuit}
-        state={frames[frames.length - 1]}
+        state={finalState}
         qasm={qasm}
         className="mt-5"
       />

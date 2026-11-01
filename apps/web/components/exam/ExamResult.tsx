@@ -22,7 +22,7 @@
  * certificate and a certificate.
  */
 
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import Link from 'next/link'
 import { Certificate } from '@/components/lesson/Certificate'
 import { authFetch } from '@/lib/authFetch'
@@ -56,12 +56,40 @@ function formatDuration(ms: number | undefined): string {
   return `${minutes}m ${seconds.toString().padStart(2, '0')}s`
 }
 
+/**
+ * True while the server's retake wait (after a paper that did not pass) is
+ * still running. Re-enables the button the moment it ends, with no reload.
+ * The server enforces the wait either way; this only stops the button from
+ * leading a candidate to an error page.
+ */
+function useRetakeWait(availableAt: string | undefined): boolean {
+  const target = availableAt ? Date.parse(availableAt) : NaN
+  const [waiting, setWaiting] = useState(() => Number.isFinite(target) && target > Date.now())
+  useEffect(() => {
+    if (!Number.isFinite(target)) {
+      setWaiting(false)
+      return
+    }
+    const remaining = target - Date.now()
+    if (remaining <= 0) {
+      setWaiting(false)
+      return
+    }
+    setWaiting(true)
+    // Clamp: setTimeout overflows past ~24.8 days, and the wait is minutes.
+    const timer = setTimeout(() => setWaiting(false), Math.min(remaining + 250, 2 ** 31 - 1))
+    return () => clearTimeout(timer)
+  }, [target])
+  return waiting
+}
+
 export function ExamResult({ exam, result, notice, onRetry, onCertificate }: ExamResultProps) {
   const [name, setName] = useState('')
   const [certificateId, setCertificateId] = useState<string | null>(result.certificateId ?? null)
   const [issuedName, setIssuedName] = useState<string | null>(null)
   const [issuing, setIssuing] = useState(false)
   const [certError, setCertError] = useState<string | null>(null)
+  const retakeWaiting = useRetakeWait(result.retakeAvailableAt)
 
   const hue = result.passed ? 'var(--q-teal)' : 'var(--q-amber)'
   const hueBorder = result.passed
@@ -368,10 +396,19 @@ export function ExamResult({ exam, result, notice, onRetry, onCertificate }: Exa
           <p className="mt-1 text-[13px] text-ink-secondary">
             A new attempt draws a different set of questions from the pool, in a different order.
             Your best score is kept.
+            {result.retakeAvailableAt
+              ? ` After a paper that does not pass there is a short wait: you can sit again from ${new Date(result.retakeAvailableAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}.`
+              : ''}
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
-          <button type="button" onClick={onRetry} className="btn-ghost focus-ring">
+          <button
+            type="button"
+            onClick={onRetry}
+            disabled={retakeWaiting}
+            aria-disabled={retakeWaiting}
+            className="btn-ghost focus-ring disabled:cursor-not-allowed disabled:opacity-50"
+          >
             Retake exam
           </button>
           <Link href="/certify" className="btn-ghost focus-ring">

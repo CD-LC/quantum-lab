@@ -57,6 +57,20 @@ export function azureBaseUrl(configured: string): string {
   return `${base}/openai`
 }
 
+/**
+ * Ceiling on one direct provider call. Deliberately shorter than the platform's
+ * request limit (Cloudflare ~100 s, Container Apps ~240 s) AND leaves room after
+ * the 25 s agent-service attempt in /api/agent, so a provider that hangs instead
+ * of erroring still ends in the route's own offline fallback rather than a
+ * socket the proxy closes. Pass it to `generateText({ abortSignal })`.
+ */
+export const LLM_CALL_TIMEOUT_MS = 30_000
+
+/** A fresh timeout signal for one provider call. */
+export function llmTimeoutSignal(ms: number = LLM_CALL_TIMEOUT_MS): AbortSignal {
+  return AbortSignal.timeout(Number.isFinite(ms) && ms > 0 ? ms : LLM_CALL_TIMEOUT_MS)
+}
+
 export function buildLanguageModel(p: ResolvedProvider): LanguageModel {
   switch (p.id) {
     case 'gemini':

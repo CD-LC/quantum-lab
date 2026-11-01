@@ -31,6 +31,8 @@
  * and in a completely empty environment.
  */
 
+import { normaliseAddress } from '../rateLimit'
+
 export interface RateLimitResult {
   /** False when this request should be refused with a 429. */
   allowed: boolean
@@ -44,19 +46,35 @@ interface Bucket {
   /** Window index: floor(now / windowMs). */
   window: number
   count: number
+  /** Epoch ms at which this bucket's window ends. */
+  expiresAt: number
 }
 
 /**
  * Keys are never removed on a schedule — there is no timer here, because a
  * `setInterval` in a serverless function is a leak with no owner. Instead a
- * bucket is replaced lazily when its window has rolled, and the whole map is
- * dropped when it grows past `MAX_KEYS`. Dropping everything is crude, but the
- * failure mode is "some callers briefly get a fresh allowance", which is the
- * right direction to fail for a limiter that is already advisory.
+ * bucket is replaced lazily when its window has rolled, and when the map
+ * reaches `MAX_KEYS` expired buckets are swept and then the OLDEST live ones
+ * are evicted. The map is never cleared: clearing hands every caller a fresh
+ * allowance, and anyone who can send 10 000 distinct keys could trigger it on
+ * demand to reset their own (and everybody else's) counters.
  */
 const MAX_KEYS = 10_000
+/** Evict down to this many entries so the O(n) pass is amortised. */
+const EVICT_TO = Math.floor(MAX_KEYS * 0.9)
 
 const buckets = new Map<string, Bucket>()
+
+function makeRoom(now: number): void {
+  for (const [k, b] of buckets) {
+    if (b.expiresAt <= now) buckets.delete(k)
+  }
+  // Still full of live keys: evict the oldest (Map iteration is insertion order).
+  for (const k of buckets.keys()) {
+    if (buckets.size <= EVICT_TO) break
+    buckets.delete(k)
+  }
+}
 
 /**
  * Count one request against `key` and report whether it is allowed.
@@ -83,8 +101,8 @@ export function check(
 
   const existing = buckets.get(key)
   if (!existing || existing.window !== window) {
-    if (buckets.size >= MAX_KEYS) buckets.clear()
-    buckets.set(key, { window, count: 1 })
+    if (!existing && buckets.size >= MAX_KEYS) makeRoom(now)
+    buckets.set(key, { window, count: 1, expiresAt: resetAt })
     return { allowed: true, remaining: safeLimit - 1, resetAt }
   }
 
@@ -116,8 +134,10 @@ export function clientKey(headers: Headers, prefix = 'anon'): string {
   const ip =
     headers.get('cf-connecting-ip')?.trim() || firstHop || headers.get('x-real-ip')?.trim() || 'unknown'
   // Bound the key: a header is caller-controlled and an unbounded map key is a
-  // memory-growth primitive even with MAX_KEYS in place.
-  return `${prefix}:${ip.slice(0, 64)}`
+  // memory-growth primitive even with MAX_KEYS in place. IPv6 is truncated to
+  // its /64 (shared with lib/rateLimit.ts): one customer owns a whole /64, so
+  // keying on the full address lets them rotate for a fresh allowance per request.
+  return `${prefix}:${normaliseAddress(ip.slice(0, 64))}`
 }
 
 /** Standard headers for a 429 so a well-behaved client can back off correctly. */

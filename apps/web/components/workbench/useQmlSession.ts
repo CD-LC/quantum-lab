@@ -56,8 +56,12 @@ export function useQmlSession() {
   const workerRef = useRef<Worker | null>(null)
   const stopFlag = useRef(false)
   const mainThreadRunning = useRef(false)
+  // False before mount and after unmount, so nothing starts a worker or a
+  // main-thread session (and nothing sets state) for a page that is gone.
+  const mounted = useRef(false)
 
   const applyMessage = useCallback((m: SessionMessage) => {
+    if (!mounted.current) return
     setState((s) => {
       switch (m.type) {
         case 'started':
@@ -87,7 +91,9 @@ export function useQmlSession() {
   }, [])
 
   useEffect(() => {
+    mounted.current = true
     return () => {
+      mounted.current = false
       workerRef.current?.terminate()
       workerRef.current = null
       stopFlag.current = true
@@ -96,6 +102,7 @@ export function useQmlSession() {
 
   const start = useCallback(
     (config: ComparisonConfig, budgetMs: number) => {
+      if (!mounted.current) return
       if (!workerRef.current) workerRef.current = buildWorker()
       const worker = workerRef.current
       if (worker) {
@@ -104,6 +111,7 @@ export function useQmlSession() {
           // The chunk failed to load or threw at top level: drop to the main thread.
           worker.terminate()
           workerRef.current = null
+          if (!mounted.current) return
           setState((s) => ({ ...s, inWorker: false }))
           startOnMainThread(config, budgetMs)
         }
@@ -118,6 +126,7 @@ export function useQmlSession() {
       function startOnMainThread(cfg: ComparisonConfig, budget: number) {
         stopFlag.current = true
         const begin = () => {
+          if (!mounted.current) return
           stopFlag.current = false
           mainThreadRunning.current = true
           void runQmlSession(cfg, applyMessage, {
@@ -133,7 +142,11 @@ export function useQmlSession() {
         }
         if (mainThreadRunning.current) {
           // Let the previous session notice the stop flag on its next yield.
-          const wait = () => (mainThreadRunning.current ? requestAnimationFrame(wait) : begin())
+          const wait = () => {
+            if (!mounted.current) return
+            if (mainThreadRunning.current) requestAnimationFrame(wait)
+            else begin()
+          }
           requestAnimationFrame(wait)
         } else {
           begin()

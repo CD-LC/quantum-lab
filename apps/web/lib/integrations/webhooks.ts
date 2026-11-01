@@ -30,12 +30,24 @@
  * receiver registers by raw IPv6 literal). The check runs at registration AND
  * again at every dispatch, so editing a row in the database does not bypass it.
  *
- * Stated limitation, on purpose: this validates the HOSTNAME, not what DNS
- * later resolves it to. A public name pointed at 10.0.0.1 (DNS rebinding) gets
- * through; closing that requires a resolver hook or an egress proxy, neither
- * of which this codebase has. docs/SECURITY.md's rule applies: say what the
- * control stops (literal-IP SSRF, the cheap and common case) and what it does
- * not.
+ * A DNS NAME is then RESOLVED (`assertPublicHost`) at registration and again at
+ * every delivery, and refused when any returned address is private, loopback,
+ * link-local, CGNAT, multicast or otherwise non-public — so `127.0.0.1.nip.io`,
+ * `localtest.me` and the internal FQDN of a sibling Container App (which
+ * resolves to a private address) are all refused. Names under `.internal`,
+ * `.local`, `.lan` and `.home.arpa`, and any name containing an `internal`
+ * label, are refused outright without a lookup.
+ *
+ * Stated RESIDUAL, on purpose: the resolve-then-connect pair is not atomic.
+ * `fetch` resolves the name again when it connects, so an attacker who controls
+ * the receiver's DNS can answer the check with a public address and the
+ * connection with a private one (DNS rebinding). Closing that needs the socket
+ * to be opened against the vetted address (a custom undici dispatcher with a
+ * `lookup` hook, or an egress proxy), and this codebase takes no new
+ * dependencies. What the guard stops: literal-IP SSRF and every name that
+ * resolves to a private address at check time — the cheap and common cases. The
+ * body is a fixed signed envelope and the response is never returned, so a
+ * successful rebind is blind. Listed in docs/SECURITY.md's residual risks.
  *
  * ── Storage ─────────────────────────────────────────────────────────────────
  *
@@ -55,6 +67,7 @@
  */
 
 import { createHash, createHmac, randomBytes } from 'node:crypto'
+import { lookup as dnsLookup } from 'node:dns/promises'
 import { getServiceSupabase, isServiceRoleConfigured } from '@/lib/billing/entitlements'
 import { reportError } from '@/lib/observability/report'
 
@@ -169,6 +182,93 @@ export function validateWebhookUrl(raw: string): UrlCheck {
     if (isPrivateIpv4(octets)) {
       return { ok: false, error: 'Webhook URLs must not point at private or reserved IP ranges.' }
     }
+  }
+  // Internal-only namespaces are refused without a lookup. Azure Container Apps
+  // gives an internal-ingress app a name with an `internal` label
+  // (`app.internal.<env>.<region>.azurecontainerapps.io`).
+  if (
+    /\.(internal|local|lan|home\.arpa|intranet|corp)$/.test(host) ||
+    host.split('.').includes('internal')
+  ) {
+    return { ok: false, error: 'Webhook URLs must not point at internal hostnames.' }
+  }
+  return { ok: true, url }
+}
+
+/** True for an IPv4 address that is not publicly routable (wider than isPrivateIpv4). */
+function isNonPublicIpv4(octets: number[]): boolean {
+  if (isPrivateIpv4(octets)) return true
+  const [a, b, c] = octets
+  if (a === 192 && b === 0 && (c === 0 || c === 2)) return true // IETF protocol / TEST-NET-1
+  if (a === 198 && (b === 18 || b === 19)) return true // benchmarking
+  if (a === 198 && b === 51 && c === 100) return true // TEST-NET-2
+  if (a === 203 && b === 0 && c === 113) return true // TEST-NET-3
+  if (a >= 224) return true // multicast, reserved, broadcast
+  return false
+}
+
+/** Classify a resolved address (v4 or v6 text) as non-public. Unparseable => refuse. */
+export function isNonPublicAddress(address: string): boolean {
+  const addr = address.trim().toLowerCase().replace(/%.*$/, '')
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(addr)) {
+    const octets = addr.split('.').map(Number)
+    if (octets.some((o) => o > 255)) return true
+    return isNonPublicIpv4(octets)
+  }
+  if (!addr.includes(':')) return true
+  // IPv4-mapped in dotted form (::ffff:10.0.0.1): judge the embedded v4.
+  const dotted = addr.match(/^(?:[0:]*:)(?:ffff:)?(\d{1,3}(?:\.\d{1,3}){3})$/)
+  if (dotted) return isNonPublicAddress(dotted[1])
+  // IPv4-mapped in hex form (::ffff:a00:1).
+  const hexMapped = addr.match(/^[0:]*:ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/)
+  if (hexMapped) {
+    const hi = parseInt(hexMapped[1], 16)
+    const lo = parseInt(hexMapped[2], 16)
+    return isNonPublicIpv4([hi >> 8, hi & 255, lo >> 8, lo & 255])
+  }
+  if (addr === '::' || addr === '::1') return true
+  const first = parseInt(addr.split(':')[0] || '0', 16)
+  if (Number.isNaN(first)) return true
+  if (first === 0) return true // ::/8 incl. IPv4-compatible and unspecified
+  if ((first & 0xfe00) === 0xfc00) return true // fc00::/7 unique local
+  if ((first & 0xffc0) === 0xfe80) return true // fe80::/10 link-local
+  if ((first & 0xff00) === 0xff00) return true // multicast
+  if (addr.startsWith('2001:db8') || addr.startsWith('2001:0db8')) return true // documentation
+  if (addr.startsWith('64:ff9b')) return true // NAT64 embeds a v4 address; refuse
+  return false
+}
+
+/** Resolves a hostname to every address it maps to. Swappable for tests. */
+export type HostResolver = (host: string) => Promise<string[]>
+
+const defaultResolver: HostResolver = async (host) =>
+  (await dnsLookup(host, { all: true, verbatim: true })).map((r) => r.address)
+
+let hostResolver: HostResolver = defaultResolver
+
+/** TEST SEAM: replace (or, with no argument, restore) the DNS resolver. */
+export function __setHostResolverForTests(resolver?: HostResolver): void {
+  hostResolver = resolver ?? defaultResolver
+}
+
+/**
+ * Resolve the URL's host and refuse it if ANY address is non-public. IP
+ * literals were fully classified by validateWebhookUrl and need no lookup. A
+ * lookup that fails or returns nothing is refused (fail closed): a receiver
+ * that cannot be resolved cannot be delivered to anyway.
+ */
+export async function assertPublicHost(url: URL): Promise<UrlCheck> {
+  const host = url.hostname.toLowerCase().replace(/\.$/, '')
+  if (/^[0-9.]+$/.test(host)) return { ok: true, url }
+  let addresses: string[]
+  try {
+    addresses = await hostResolver(host)
+  } catch {
+    return { ok: false, error: 'Webhook host could not be resolved.' }
+  }
+  if (addresses.length === 0) return { ok: false, error: 'Webhook host could not be resolved.' }
+  if (addresses.some(isNonPublicAddress)) {
+    return { ok: false, error: 'Webhook URLs must not resolve to private or reserved addresses.' }
   }
   return { ok: true, url }
 }
@@ -410,7 +510,9 @@ export async function registerEndpoint(
   rawUrl: string,
   rawEvents: unknown
 ): Promise<RegisterResult> {
-  const checked = validateWebhookUrl(rawUrl)
+  const syntactic = validateWebhookUrl(rawUrl)
+  if (!syntactic.ok) return { ok: false, error: syntactic.error }
+  const checked = await assertPublicHost(syntactic.url)
   if (!checked.ok) return { ok: false, error: checked.error }
 
   if (!Array.isArray(rawEvents) || rawEvents.length === 0) {
@@ -478,7 +580,11 @@ export async function deliverToEndpoint(
 ): Promise<DeliveryOutcome> {
   // Re-check at dispatch time: a row edited in the database, or one written
   // before the guard tightened, must not turn the dispatcher into a proxy.
-  const checked = validateWebhookUrl(endpoint.url)
+  const syntactic = validateWebhookUrl(endpoint.url)
+  if (!syntactic.ok) return { delivered: false, attempts: 0 }
+  // …and resolve it: a public-looking name that points at a private address is
+  // refused here too (see assertPublicHost for the rebinding residual).
+  const checked = await assertPublicHost(syntactic.url)
   if (!checked.ok) return { delivered: false, attempts: 0 }
 
   const signature = signWebhookPayload(endpoint.secret, body)

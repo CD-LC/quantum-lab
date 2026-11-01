@@ -39,7 +39,7 @@
  * that apply to every request:
  *   · Rate limiting via lib/rateLimit.ts, two windows, same shape as
  *     /api/agent. Simulation is CPU, not money, so the limits are looser.
- *   · Body size capped BEFORE parsing (safeJson), like every other route.
+ *   · Body size capped WHILE READING (readJsonBody), like every other route.
  *   · Origin, when a browser sends one, must match this host — the DNS
  *     rebinding guard the transport spec requires. Non-browser MCP clients
  *     send no Origin and are unaffected.
@@ -47,9 +47,9 @@
 
 import { NextResponse } from 'next/server'
 import { callerKey, rateLimit, retryAfterHeaders } from '@/lib/rateLimit'
-import { isRecord, safeJson } from '@/lib/security/validate'
+import { isRecord, readJsonBody } from '@/lib/security/validate'
 import { reportError } from '@/lib/observability/report'
-import { callToolAsync, getTool, listToolsResult } from '@/lib/mcp/server'
+import { callToolAsync, clientAddressFrom, getTool, listToolsResult } from '@/lib/mcp/server'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -172,14 +172,19 @@ async function handleToolsCall(id: JsonRpcId, params: unknown, req: Request): Pr
   if (!getTool(params.name)) {
     return rpcError(id, { code: INVALID_PARAMS, message: `Unknown tool: ${params.name}` })
   }
-  // The context carries exactly two headers, verbatim. `authorization` is how
-  // submit_hardware_job authenticates its caller against the real hardware
-  // route (identity from the transport, never from tool arguments) and
-  // `x-forwarded-for` keeps that route's IP rate limit keyed on the actual
-  // caller. Neither is stored anywhere — the server stays stateless.
+  // The context carries the caller's `authorization` header verbatim (how
+  // submit_hardware_job and generate_verified_circuit identify the caller:
+  // identity from the transport, never from tool arguments) and ONE client
+  // address, resolved with the same precedence this route's own rate limiter
+  // keys on. The raw `x-forwarded-for` is NOT passed on: Cloudflare only
+  // appends to it, so its first hop is client-chosen and forwarding it let a
+  // caller pick their own bucket in the hardware route and the daily model
+  // quota. Neither value is stored anywhere — the server stays stateless.
+  const clientIp = clientAddressFrom(req.headers)
   const ctx = {
     authorization: req.headers.get('authorization'),
-    forwardedFor: req.headers.get('x-forwarded-for'),
+    clientIp,
+    forwardedFor: clientIp,
   }
   return rpcResult(id, await callToolAsync(params.name, params.arguments, ctx))
 }
@@ -235,7 +240,10 @@ export async function POST(req: Request, ctx: RouteContext): Promise<Response> {
       )
     }
 
-    const parsed = safeJson(await req.text(), MAX_BODY_BYTES)
+    const parsed = await readJsonBody(req, MAX_BODY_BYTES)
+    if (!parsed.ok && parsed.tooLarge) {
+      return rpcError(null, { code: INVALID_REQUEST, message: parsed.error }, 413)
+    }
     if (!parsed.ok) {
       return rpcError(null, { code: PARSE_ERROR, message: parsed.error }, 400)
     }

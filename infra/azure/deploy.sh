@@ -20,7 +20,8 @@
 #   3. Creates a Container Apps environment (Consumption plan)
 #   4. Deploys api as an always-on Container App (min-replicas 1 — see the
 #      comment above its deploy step), smallest valid size (0.25 vCPU / 0.5 GiB)
-#   5. Deploys agent as scale-to-zero (0..1 replicas), same size
+#   5. Deploys agent always-on (min-replicas 1: a cold start outlasts the web
+#      app's 25 s agent timeout), same size
 #   6. Rebuilds web with real API/agent URLs baked in, deploys web also
 #      always-on (min-replicas 1 — see the comment above its deploy step,
 #      also 0.25 vCPU / 0.5 GiB)
@@ -32,11 +33,10 @@
 #
 # Cost model is fundamentally different from the AWS App Runner version:
 # Container Apps CAN scale to zero, so a service left at min-replicas=0 with
-# no traffic bills $0 in compute. api and web are both pinned to
+# no traffic bills $0 in compute. api, agent and web are all pinned to
 # min-replicas=1 instead (see the comments above each deploy step for why —
-# both trade ~$10-15/mo each for no cold-start tax), so only agent actually
-# scales to zero here. The fixed floor is therefore roughly $20-30/mo
-# (api + web always-on) plus the Basic ACR (~$5/mo flat) and a small amount of
+# each trades ~$10-15/mo for no cold-start tax). The fixed floor is therefore
+# roughly $30-45/mo (api + agent + web always-on) plus the Basic ACR (~$5/mo flat) and a small amount of
 # Log Analytics ingestion (~$0-2/mo at this volume) — see
 # docs/DEPLOYMENT-AZURE.md for the full breakdown.
 set -euo pipefail
@@ -430,8 +430,8 @@ fi
 # ~5s in production. That was surfaced as "it takes too long to load, even
 # after being idle for a bit" and traded away deliberately: one always-on
 # 0.25 vCPU / 0.5 GiB replica costs roughly $10-15/mo, in exchange for the
-# api never cold-starting. agent stays scale-to-zero (min-replicas 0) below
-# since it has no import-cost problem of its own and is hit far less often.
+# api never cold-starting. agent is pinned always-on below as well: its cold
+# start outlasts the web app's 25 s agent timeout.
 #
 # web used to be scale-to-zero here too, on the reasoning that Next.js has no
 # Qiskit-style import cost. That reasoning held when the site was ~30 routes;
@@ -486,7 +486,10 @@ echo "==> api: $API_URL"
 curl -s -o /dev/null -w "   /api/health -> %{http_code}\n" "$API_URL/api/health" || true
 
 # --------------------------------------------------------------- 5. agent
-echo "==> Deploying services/agent (scale-to-zero, 0.25 vCPU / 0.5 GiB)"
+# min-replicas 1, not 0: a scale-from-zero cold start (image pull + Python +
+# model client import) always exceeds the web app's 25 s agent timeout, so the
+# first tutor question after any idle spell fell through to the offline FAQ.
+echo "==> Deploying services/agent (min-replicas 1, 0.25 vCPU / 0.5 GiB)"
 AGENT_SECRETS=()
 AGENT_ENV_VARS=(MODEL="$AGENT_MODEL" ALLOWED_ORIGINS=http://localhost:3000)
 [ -n "$GEMINI_KEY" ]    && AGENT_SECRETS+=(gemini-api-key="$GEMINI_KEY")    && AGENT_ENV_VARS+=(GEMINI_API_KEY=secretref:gemini-api-key)
@@ -498,7 +501,7 @@ if ! az containerapp show -n quantum-lab-agent -g "$RESOURCE_GROUP" >/dev/null 2
     --image "$ACR_LOGIN_SERVER/quantum-lab/agent:$TAG"
     --registry-server "$ACR_LOGIN_SERVER" --registry-username "$ACR_USER" --registry-password "$ACR_PASS"
     --target-port 8001 --ingress internal
-    --min-replicas 0 --max-replicas 1 --cpu 0.25 --memory 0.5Gi
+    --min-replicas 1 --max-replicas 1 --cpu 0.25 --memory 0.5Gi
     --env-vars "${AGENT_ENV_VARS[@]}")
   if [ "${#AGENT_SECRETS[@]}" -gt 0 ]; then
     CREATE_ARGS+=(--secrets "${AGENT_SECRETS[@]}")
@@ -516,6 +519,7 @@ else
   fi
   az containerapp update -n quantum-lab-agent -g "$RESOURCE_GROUP" \
     --image "$ACR_LOGIN_SERVER/quantum-lab/agent:$TAG" \
+    --min-replicas 1 --max-replicas 1 \
     --set-env-vars "${AGENT_ENV_VARS[@]}" >/dev/null
 fi
 # The agent has no authentication of its own; only the web app's /api/agent
@@ -551,6 +555,10 @@ fi
 PUBLIC_URL="${PUBLIC_URL:-}"
 echo "==> Public URL baked into web: ${PUBLIC_URL:-(blank: first deploy — re-run or attach-domain.sh will set it)}"
 
+# The commit being built, so /api/health and Sentry can say which release is
+# live. Empty (not an error) when this is not a git checkout.
+RELEASE_SHA="${NEXT_PUBLIC_SENTRY_RELEASE:-$(git rev-parse HEAD 2>/dev/null || true)}"
+
 echo "==> Building web pass 2 with real URLs baked in (az acr build, queued + polled)"
 acr_build_async "quantum-lab/web:$TAG-web" "apps/web/Dockerfile" "." \
   "NEXT_PUBLIC_APP_URL=$PUBLIC_URL" \
@@ -560,7 +568,10 @@ acr_build_async "quantum-lab/web:$TAG-web" "apps/web/Dockerfile" "." \
   "NEXT_PUBLIC_SENTRY_DSN=${NEXT_PUBLIC_SENTRY_DSN:-}" \
   "NEXT_PUBLIC_LAUNCH_TRIAL_DAYS=${NEXT_PUBLIC_LAUNCH_TRIAL_DAYS:-}" \
   "NEXT_PUBLIC_LAUNCH_TRIAL_UNTIL=${NEXT_PUBLIC_LAUNCH_TRIAL_UNTIL:-}" \
-  "NEXT_PUBLIC_ANALYTICS_ENDPOINT=${NEXT_PUBLIC_ANALYTICS_ENDPOINT:-}"   "NEXT_PUBLIC_DEVICE_TUTOR=${NEXT_PUBLIC_DEVICE_TUTOR:-}"
+  "NEXT_PUBLIC_ANALYTICS_ENDPOINT=${NEXT_PUBLIC_ANALYTICS_ENDPOINT:-}" \
+  "NEXT_PUBLIC_DEVICE_TUTOR=${NEXT_PUBLIC_DEVICE_TUTOR:-}" \
+  "NEXT_PUBLIC_SENTRY_RELEASE=${RELEASE_SHA}" \
+  "NEXT_PUBLIC_BUILD_STAMP=${RELEASE_SHA:0:12}"
 
 echo "==> Deploying apps/web (min-replicas 1 — see comment above api's deploy step; 0.25 vCPU / 0.5 GiB)"
 # The NEW value, never the overlap: web presents exactly one secret, and the
@@ -1013,9 +1024,8 @@ echo "   api:   $API_URL   (always-on, min-replicas 1 — public URL, but"
 echo "                      unauthenticated by default unless"
 echo "                      API_SHARED_SECRET is enforced — see"
 echo "                      docs/SECURITY.md; same exposure as the AWS kit)"
-echo "   agent: $AGENT_URL (internal ingress; scale-to-zero — bills \$0 at zero traffic, but"
-echo "                      the first request after idle pays a real"
-echo "                      cold-start delay)"
+echo "   agent: $AGENT_URL (internal ingress; always-on, min-replicas 1 — a"
+echo "                      cold start would outlast the web 25 s timeout)"
 echo ""
 echo " web and api are pinned always-on (~\$10-15/mo each) specifically to"
 echo " avoid the cold-start tax that was measured hitting real users on"

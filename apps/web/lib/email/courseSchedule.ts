@@ -34,7 +34,9 @@ export const COURSE_LENGTH_DAYS = 7
 
 export type CourseDay = 1 | 2 | 3 | 4 | 5 | 6 | 7
 
-const DAY_MS = 24 * 60 * 60 * 1000
+/** One course day, in milliseconds. Exported so the dispatcher's due filter uses the same clock arithmetic. */
+export const COURSE_DAY_MS = 24 * 60 * 60 * 1000
+const DAY_MS = COURSE_DAY_MS
 
 export function isCourseDay(value: unknown): value is CourseDay {
   return (

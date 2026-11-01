@@ -38,7 +38,10 @@ export async function GET(
     return apiError('rate_limited', { headers: retryAfterHeaders(decision) })
   }
 
-  const result = await lookupCertificate(decodeURIComponent(params.certificateId))
+  // Next has already percent-decoded the segment; decoding it again threw a
+  // URIError (a 500) on input such as `%E0`. parseCertificateId rejects
+  // anything malformed, so the value goes straight through.
+  const result = await lookupCertificate(params.certificateId)
   if (!result.valid || !result.name || !result.issuedAt) {
     return apiError('not_found', {
       message: 'No badge exists for that certificate number.',

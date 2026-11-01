@@ -241,9 +241,18 @@ create index if not exists hardware_usage_operator_window_idx
 -- #  one this adds the column and replaces it in the same     #
 -- #  file, in that order.                                     #
 -- #                                                           #
--- #  The signatures are unchanged, so the grants and revokes  #
--- #  those files applied still attach to these functions and  #
--- #  apps/web needs no new RPC.                               #
+-- #  The signatures are unchanged, so apps/web needs no new   #
+-- #  RPC. The GRANTS are a different matter and the two       #
+-- #  functions differ: reserve_hardware_job is `create or     #
+-- #  replace`, which keeps the grants schema-billing.sql      #
+-- #  applied; spend_in_window is DROP + CREATE (its result    #
+-- #  set changed), and DROP FUNCTION discards every revoke    #
+-- #  schema-budgets.sql applied while CREATE FUNCTION hands   #
+-- #  EXECUTE back to PUBLIC — and Supabase's default           #
+-- #  privileges to anon and authenticated. The revokes are    #
+-- #  therefore RE-APPLIED right after the new body below.     #
+-- #  (Audit 2026-10-22: this file shipped without them, and   #
+-- #  the anon key could call spend_in_window for any uuid.)   #
 -- ############################################################
 -- ============================================================
 
@@ -391,3 +400,19 @@ $$;
 
 comment on function public.spend_in_window(uuid, timestamptz) is
   'ESTIMATED USD spent in [p_period_start, now) on the OPERATOR''s credentials, the job and shot counts behind it, and the number of jobs that could not be priced at all (they contribute 0 and therefore UNDERSTATE the total). BYOK jobs are excluded: this platform never sees what the vendor charged the user.';
+
+-- ── Grants, RE-APPLIED ───────────────────────────────────────
+-- SECURITY FIX (audit 2026-10-22). `drop function` above threw
+-- away the revokes schema-budgets.sql applied to spend_in_window,
+-- and `create function` gave EXECUTE back to PUBLIC — on Supabase
+-- the default privileges add anon and authenticated on top. The
+-- function is SECURITY DEFINER over hardware_usage, so until this
+-- block existed anyone holding the public anon key could read any
+-- user's spend, job count, shots and QPU seconds for any window
+-- by passing that user's uuid. Same block as schema-budgets.sql,
+-- same reasoning: service_role only. verify-migrations.sql checks
+-- that no SECURITY DEFINER function is executable by a user role.
+revoke all on function public.spend_in_window(uuid, timestamptz) from public;
+revoke all on function public.spend_in_window(uuid, timestamptz) from anon;
+revoke all on function public.spend_in_window(uuid, timestamptz) from authenticated;
+grant execute on function public.spend_in_window(uuid, timestamptz) to service_role;

@@ -23,6 +23,13 @@ export interface HardwareDevice {
   reason: string | null
   /** Queue depth, when the provider reports one. */
   pending_jobs: number | null
+  /**
+   * True when this device is available ONLY because the signed-in caller has
+   * stored their own credential for its vendor (BYOK). The operator has no
+   * credential for it, so the job will run, and be billed, on the caller's own
+   * account. Absent otherwise.
+   */
+  byok?: boolean
 }
 
 /** Response of POST /api/hardware/estimate (transpile.py::estimate_cost). */

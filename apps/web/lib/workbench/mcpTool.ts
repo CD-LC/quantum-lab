@@ -13,6 +13,8 @@ import { validateSpec, type CircuitSpec, type VerifyResult } from './verify'
 
 /** Same QASM size bound the rest of the MCP surface applies. */
 export const GENERATE_MAX_QASM_CHARS = 20_000
+/** Gates in a supplied candidate. Spec circuits are a handful of gates; ~1,300 cost ~5 s of event loop. */
+export const GENERATE_MAX_CANDIDATE_OPS = 300
 /** A spec is a small object; 32 KB is a 5-qubit unitary written out with room to spare. */
 export const GENERATE_MAX_SPEC_CHARS = 32_000
 
@@ -59,6 +61,14 @@ export function parseGenerateArgs(args: Record<string, unknown>): GenerateToolAr
       candidate = fromQasm(args.candidate_qasm)
       if (candidate.ops.length === 0) {
         return { ok: false, error: 'candidate_qasm parsed to zero gates. Expected OpenQASM 3.' }
+      }
+      // The size cap alone admits ~2,000 one-line gates, and verification
+      // enumerates measurement branches synchronously: bound the work.
+      if (candidate.ops.length > GENERATE_MAX_CANDIDATE_OPS) {
+        return {
+          ok: false,
+          error: `candidate_qasm has ${candidate.ops.length} gates; the ceiling is ${GENERATE_MAX_CANDIDATE_OPS}.`,
+        }
       }
     }
   }

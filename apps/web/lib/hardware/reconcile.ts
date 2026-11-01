@@ -35,6 +35,16 @@
  * than an honest gap. Fixing this properly needs a column — see the note at
  * the bottom of this file.
  *
+ * BYOK JOBS ARE POLLED WITH THEIR OWNER'S CREDENTIAL. A job submitted on a
+ * user's own vendor token (`credential_owner = 'user'`) is invisible to the
+ * operator's token — the vendor answers "no such job" — exactly as the poll
+ * route's own comment explains. So for those rows the sweep opens the stored
+ * credential (`resolveSubmissionCredential`, the same decision the submit and
+ * poll routes make) and presents it for that one request. When the credential
+ * is gone (removed, or the encryption key rotated) or the store refuses, the
+ * row is counted `unreachable` and left untouched: polling it with the
+ * operator's token could only produce a misleading 404.
+ *
  * A 404 FROM THE VENDOR IS NOT WRITTEN DOWN as an error. A job id the vendor
  * no longer serves and an upstream that is misconfigured for five minutes look
  * identical from here, and recording the second one as a permanent `error`
@@ -46,7 +56,7 @@
  * sweep does NOT, so a user with an integration configured is notified about
  * exactly the jobs they were already watching and not about the ones this
  * module exists for. That is backwards, and it is a gap rather than a
- * decision: wiring it needs `user_id` back in SWEEP_COLUMNS and a deliberate
+ * decision: wiring it needs a deliberate
  * answer to the first-sweep problem (the first pass after this ships will find
  * every historical `queued` row at once and would notify for jobs that
  * finished weeks ago, bounded only by the batch limit). Left unwired rather
@@ -77,8 +87,10 @@
  */
 
 import { getServiceSupabase, isServiceRoleConfigured } from '@/lib/billing/entitlements'
+import { resolveSubmissionCredential } from '@/lib/hardware/byok'
 import { forward, forwardedJson } from '@/lib/hardware/proxy'
 import { isTerminalStatus } from '@/lib/hardware/types'
+import type { ResolvedCredential } from '@/lib/security/providerCredentials'
 
 /**
  * Default rows per pass. Bounded because a sweep with no bound is a way to
@@ -187,12 +199,17 @@ const JOB_SEGMENT = /^[A-Za-z0-9:_-]+$/
 const NON_TERMINAL_FILTER = 'status.is.null,status.in.(queued,running)'
 
 /** Columns the sweep needs, and only those. `qasm` is deliberately not among
- *  them — it is the largest column in the table and nothing here reads it —
- *  and neither is `user_id`: the sweep writes by primary key and has no caller
- *  to scope to, so selecting an owner id it never uses would be one more piece
- *  of account data on the wire for nothing. (The unwired notification seam in
- *  the header is the one thing that would need it back.) */
-const SWEEP_COLUMNS = 'id, provider, job_id, status, created_at'
+ *  them — it is the largest column in the table and nothing here reads it.
+ *  `user_id` and `credential_owner` ARE here, and only for one purpose: a job
+ *  submitted on a user's own vendor credential can only be read back with that
+ *  credential, so the sweep has to know whose it is. Neither is written back
+ *  or reported. */
+const SWEEP_COLUMNS = 'id, provider, job_id, status, created_at, user_id, credential_owner'
+
+/** The same select for a database that predates `credential_owner`
+ *  (supabase/schema-byok.sql not applied yet): every row is then operator
+ *  funded, which is also how `usage.ts` reads such a row. */
+const LEGACY_SWEEP_COLUMNS = 'id, provider, job_id, status, created_at'
 
 /**
  * The service-role client, non-null.
@@ -211,6 +228,10 @@ interface SweepRow {
   jobId: string
   status: string | null
   createdAt: string
+  /** Whose vendor credential the job was submitted with. */
+  credentialOwner: 'operator' | 'user'
+  /** The owning account; only ever used to open a BYOK credential. */
+  userId: string
 }
 
 /** Why a pass stopped where it did. Never absent — silence reads as "done". */
@@ -381,6 +402,8 @@ function toSweepRow(row: unknown): SweepRow | null {
     jobId,
     status: typeof r.status === 'string' ? r.status : null,
     createdAt: typeof r.created_at === 'string' ? r.created_at : '',
+    credentialOwner: r.credential_owner === 'user' ? 'user' : 'operator',
+    userId: typeof r.user_id === 'string' ? r.user_id : '',
   }
 }
 
@@ -425,6 +448,25 @@ async function pollUpstream(row: SweepRow): Promise<Observation | null> {
     .map((segment) => encodeURIComponent(segment))
     .join('/')
 
+  // A BYOK job is only visible to the vendor account it was submitted on, so
+  // it is polled with that account's credential or not at all. A missing
+  // credential or an unreadable store is "could not answer", never a fallback
+  // to the operator's token (which would only get a misleading 404).
+  let credential: ResolvedCredential | null = null
+  if (row.credentialOwner === 'user') {
+    if (!row.userId) return null
+    try {
+      credential = await resolveSubmissionCredential(row.userId, row.provider, null)
+    } catch (err) {
+      console.error(
+        `[hardware/reconcile] could not open the BYOK credential for ${row.provider}/${row.jobId}: ` +
+          String(err)
+      )
+      return null
+    }
+    if (!credential) return null
+  }
+
   let data: Record<string, unknown> | null
   try {
     // `forward` presents the operator's shared secret. That is legitimate
@@ -432,7 +474,12 @@ async function pollUpstream(row: SweepRow): Promise<Observation | null> {
     // read out of our own `hardware_usage` table, and the cron secret has
     // already been checked by the route. Nothing from this response is
     // returned to the caller — it goes into the row.
-    const response = await forward(`/api/hardware/job/${row.provider}/${path}`)
+    const response = await forward(
+      `/api/hardware/job/${row.provider}/${path}`,
+      undefined,
+      undefined,
+      credential
+    )
     data = await forwardedJson(response)
   } catch {
     // `forward` swallows its own network failures into a 504, so reaching here
@@ -611,18 +658,24 @@ export async function reconcileHardwareJobs(
 
   let rawRows: unknown[]
   try {
-    const { data, error } = await supabase
-      .from('hardware_usage')
-      .select(SWEEP_COLUMNS)
-      .not('job_id', 'is', null)
-      .or(NON_TERMINAL_FILTER)
-      .lt('created_at', staleBefore)
-      .gt('created_at', floor)
-      // Oldest first: the jobs most likely to have finished, and the ones a
-      // user is least likely to still have a tab open on. STALE_FLOOR_DAYS is
-      // what stops an unresolvable old row from owning this slot forever.
-      .order('created_at', { ascending: true })
-      .limit(limit)
+    const selectBatch = (columns: string) =>
+      supabase
+        .from('hardware_usage')
+        .select(columns)
+        .not('job_id', 'is', null)
+        .or(NON_TERMINAL_FILTER)
+        .lt('created_at', staleBefore)
+        .gt('created_at', floor)
+        // Oldest first: the jobs most likely to have finished, and the ones a
+        // user is least likely to still have a tab open on. STALE_FLOOR_DAYS is
+        // what stops an unresolvable old row from owning this slot forever.
+        .order('created_at', { ascending: true })
+        .limit(limit)
+    let { data, error } = await selectBatch(SWEEP_COLUMNS)
+    if (error && /credential_owner/i.test(error.message ?? '')) {
+      // Pre-BYOK schema: no such column, so no row can be BYOK funded.
+      ;({ data, error } = await selectBatch(LEGACY_SWEEP_COLUMNS))
+    }
     if (error) {
       return emptyReport(
         'store_unavailable',

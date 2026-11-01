@@ -60,6 +60,52 @@ export function isLate(deadlineIso: string, now: number): boolean {
   return now > deadline + SUBMIT_GRACE_MS
 }
 
+/**
+ * How far the browser's clock is ahead of the server's, in milliseconds.
+ *
+ * `expiresAt` is a server stamp. Comparing it against a raw `Date.now()` in the
+ * browser made the countdown only as good as the candidate's system clock: a
+ * device five minutes fast auto-submitted a 25-minute paper at minute 20, and
+ * one five minutes slow showed time left while the server was already refusing
+ * answers. The attempt payload now carries `serverNow`; the runner takes this
+ * offset once per adopt and subtracts it from every subsequent `Date.now()`.
+ *
+ * Unparseable input gives 0 — the old behaviour, not a NaN countdown. The
+ * network delay between the server stamping `serverNow` and the browser reading
+ * it is absorbed into the offset (it reads as the client being slightly fast),
+ * which errs towards submitting a few hundred milliseconds early rather than
+ * late; the server's `SUBMIT_GRACE_MS` covers the other direction.
+ */
+export function clockOffsetMs(serverNowIso: string | undefined, clientNow: number): number {
+  if (typeof serverNowIso !== 'string') return 0
+  const server = Date.parse(serverNowIso)
+  if (Number.isNaN(server)) return 0
+  return clientNow - server
+}
+
+/**
+ * How long a subject waits after a FAILED paper before the server deals them
+ * another at the same exam. Long enough that "answer everything, read the key,
+ * start again" cannot be looped ten times a minute to harvest the bank; short
+ * enough that a candidate who failed by a question can revise the lesson the
+ * review named and sit again the same afternoon. A pass is never delayed.
+ */
+export const RETAKE_COOLDOWN_MS = 15 * 60_000
+
+/**
+ * ISO time from which a fresh paper may be dealt after a closed attempt, or
+ * undefined when there is no wait (a pass, an open paper, or unparseable input).
+ */
+export function retakeAvailableAt(
+  submittedAtIso: string | undefined,
+  passed: boolean | undefined
+): string | undefined {
+  if (!submittedAtIso || passed !== false) return undefined
+  const submitted = Date.parse(submittedAtIso)
+  if (Number.isNaN(submitted)) return undefined
+  return new Date(submitted + RETAKE_COOLDOWN_MS).toISOString()
+}
+
 /** "12:04", or "0:59". Kept here so the runner and the result agree. */
 export function formatClock(ms: number): string {
   const totalSeconds = Math.max(0, Math.floor(ms / 1000))

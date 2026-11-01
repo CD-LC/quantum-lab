@@ -57,6 +57,13 @@ export function isAppShell(): boolean {
  *    page the app opens, and the launch URL carries `?app=android`. Either is
  *    remembered in sessionStorage — per tab, so it never leaks into ordinary
  *    Chrome browsing of qubit16.ai the way localStorage would.
+ *
+ *    The `?app=android` marker is only honoured on an Android user agent that is
+ *    running in an installed-app display mode (a TWA matches `standalone`; a
+ *    normal browser tab matches `browser`). Otherwise anyone could hide the
+ *    purchase path for every visitor by sharing a `/pricing?app=android` link.
+ *    `?app=ios` is not honoured at all: the iOS app is identified by its
+ *    user-agent token.
  */
 export const STORE_APP_ATTR = 'data-store-app'
 export const ANDROID_PACKAGE = 'ai.qubit16.app'
@@ -65,7 +72,7 @@ export const STORE_APP_SCRIPT = `(function(){try{
 var d=document.documentElement,k="qubit16.storeApp",s=false;
 if(navigator.userAgent.indexOf("${NATIVE_SHELL_UA_TOKEN}")>-1)s=true;
 if(document.referrer.indexOf("android-app://${ANDROID_PACKAGE}")===0)s=true;
-if(/[?&]app=(android|ios)(&|$)/.test(location.search))s=true;
+if(/[?&]app=android(&|$)/.test(location.search)&&/Android/.test(navigator.userAgent)){try{if(matchMedia("(display-mode: standalone)").matches||matchMedia("(display-mode: fullscreen)").matches)s=true}catch(e){}}
 try{if(s)sessionStorage.setItem(k,"1");else if(sessionStorage.getItem(k)==="1")s=true}catch(e){}
 if(s)d.setAttribute("${STORE_APP_ATTR}","1");
 }catch(e){}})()`

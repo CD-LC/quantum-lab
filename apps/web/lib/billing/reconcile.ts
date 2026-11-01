@@ -54,7 +54,7 @@ import type Stripe from 'stripe'
 import { getStripe, isStripeConfigured } from './stripe'
 import { getServiceSupabase } from './entitlements'
 import { applySubscription, stateFromStripe, type SubscriptionState } from './subscription'
-import type { PlanId } from '@/lib/plans'
+import type { PlanId, SubscriptionStatus } from '@/lib/plans'
 
 export type ReconcileOutcome =
   /** Stripe is not configured in this environment; nothing to reconcile against. */
@@ -79,13 +79,20 @@ interface StoredRow {
  * (an old canceled one and a new active one is the normal shape after a
  * re-subscribe), and the row has space for exactly one, so we take the one that
  * actually grants access rather than the newest by id.
+ *
+ * `unpaid` sits BELOW `canceled`. Both mean the subscription is over (see
+ * `toStatus`), but it used to rank above canceled, so a customer holding one
+ * of each had their unpaid subscription chosen — and, through the old
+ * `unpaid → past_due` mapping, kept paid access for a subscription Stripe had
+ * stopped charging. Ranking it last means a reconciliation never prefers it.
  */
 const STATUS_RANK: Record<string, number> = {
-  active: 5,
-  trialing: 4,
-  past_due: 3,
-  unpaid: 2,
-  incomplete: 1,
+  active: 6,
+  trialing: 5,
+  past_due: 4,
+  incomplete: 3,
+  canceled: 2,
+  unpaid: 1,
 }
 
 function rank(sub: Stripe.Subscription): number {
@@ -189,6 +196,12 @@ export async function reconcileEntitlement(userId: string): Promise<ReconcileOut
  * per window, which is a handful, not an incident.
  */
 const RECONCILE_COOLDOWN_MS = 10 * 60_000
+
+const ENTITLING_STATUSES: ReadonlySet<SubscriptionStatus> = new Set([
+  'active',
+  'trialing',
+  'past_due',
+])
 const lastAttempt = new Map<string, number>()
 
 /**
@@ -200,14 +213,24 @@ const lastAttempt = new Map<string, number>()
  * in the past. A renewal moves that field forward every period without fail, so
  * a value a day past its end means we missed the renewal — not that the
  * customer is between periods. Widening this test widens the Stripe traffic on
- * a hot path; do not widen it to "status is not active".
+ * a hot path; do not widen it to "status is not active". It is also NARROWED to
+ * rows whose stored status still grants access: a canceled row's period end is
+ * in the past permanently and would otherwise match forever.
  */
 export async function reconcileIfStale(
   userId: string,
   currentPeriodEnd: string | null | undefined,
-  now: Date = new Date()
+  now: Date = new Date(),
+  status?: SubscriptionStatus
 ): Promise<boolean> {
   if (!isStripeConfigured || !userId || !currentPeriodEnd) return false
+  // A row that is already over (canceled / none / incomplete) keeps its past
+  // period end forever, so without this every ex-subscriber re-queried Stripe
+  // every cooldown for as long as they used the site, for no change. Only a row
+  // still claiming access can be provably behind Stripe. A missed
+  // RE-subscription on a canceled row is recovered by the account page's
+  // post-checkout reconcile instead (POST /api/billing/reconcile).
+  if (status !== undefined && !ENTITLING_STATUSES.has(status)) return false
   const end = Date.parse(currentPeriodEnd)
   if (Number.isNaN(end) || now.getTime() - end < 24 * 60 * 60_000) return false
 

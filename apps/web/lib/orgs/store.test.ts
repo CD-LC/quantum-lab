@@ -157,9 +157,9 @@ describe('the store with a server context', () => {
       { name: 'Acme', planId: 'team', ownerId: VICTIM, ownerEmail: 'v@acme.test' },
       ctxFor(client)
     )
-    const orgInsert = calls.find((c) => c.table === 'orgs')
+    const orgInsert = calls.find((c) => c.table === 'orgs' && c.inserted)
     expect(orgInsert?.inserted?.owner_id).toBe(CALLER)
-    const memberInsert = calls.find((c) => c.table === 'org_members')
+    const memberInsert = calls.find((c) => c.table === 'org_members' && c.inserted)
     expect(memberInsert?.inserted?.user_id).toBe(CALLER)
   })
 

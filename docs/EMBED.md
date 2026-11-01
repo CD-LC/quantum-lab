@@ -92,6 +92,19 @@ The variable is `NEXT_PUBLIC_` because middleware inlines it at build time —
 changing the allowlist requires a redeploy, which is the right friction for a
 framing policy.
 
+**Deployment status: partners cannot frame the widget until the variable is
+set.** `NEXT_PUBLIC_EMBED_ANCESTORS` is unset in production unless the
+production build environment sets it, and with it unset `/embed/circuit` is
+served with `frame-ancestors 'self'` (and `X-Frame-Options: SAMEORIGIN`), so
+any cross-origin iframe, including a partner's lesson page, renders blank. That
+is the intended safe default and it is not loosened to make a demo work. To go
+live for a named partner: add their origins to the production build
+environment, rebuild and redeploy (it is inlined at build time), then confirm
+with `curl -sI https://<host>/embed/circuit | grep -i content-security-policy`
+that `frame-ancestors` lists them. Only `http:` and `https:` origins are
+accepted; anything else is dropped. Until then, do not give partners the
+`embed.js` snippet: it will not load.
+
 **X-Frame-Options stays `SAMEORIGIN` everywhere — deliberately.** vercel.json
 applies `X-Frame-Options: SAMEORIGIN` at the edge, *after* middleware, and
 `lib/security/headers.ts`'s contract is that the two never diverge. So the

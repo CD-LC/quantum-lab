@@ -1,7 +1,7 @@
 """Fetch and interpret arXiv papers for the tutor.
 
 This is the only part of the agent service that touches the network. It calls
-the public arXiv Atom API at ``http://export.arxiv.org/api/query`` with
+the public arXiv Atom API at ``https://export.arxiv.org/api/query`` with
 ``httpx`` and parses the response with :mod:`xml.etree.ElementTree` from the
 standard library — deliberately no feedparser, no extra dependency.
 
@@ -24,12 +24,13 @@ __all__ = [
     "ARXIV_API_URL",
     "USER_AGENT",
     "REQUEST_TIMEOUT",
+    "MAX_RESPONSE_BYTES",
     "fetch_paper",
     "extract_quantum_context",
 ]
 
 #: The public arXiv Atom API endpoint.
-ARXIV_API_URL: str = "http://export.arxiv.org/api/query"
+ARXIV_API_URL: str = "https://export.arxiv.org/api/query"
 
 # arXiv's API usage guidance asks callers to identify themselves and to keep
 # request rates low (roughly one request every few seconds, and no hammering
@@ -40,6 +41,12 @@ USER_AGENT: str = "QuantumLabTutor/1.0 (+https://github.com/quantum-lab; educati
 
 #: Seconds before the single request is abandoned.
 REQUEST_TIMEOUT: float = 15.0
+
+#: Hard cap on the response bytes read. One paper's Atom entry is a few KB; the
+#: body lands in memory and is parsed as XML inside a 0.5 GiB container, so an
+#: oversized or redirected response is refused while it streams, not after.
+#: Same value as agent.paper.MAX_RESPONSE_BYTES.
+MAX_RESPONSE_BYTES: int = 512 * 1024
 
 _ATOM = "{http://www.w3.org/2005/Atom}"
 _ARXIV_NS = "{http://arxiv.org/schemas/atom}"
@@ -136,7 +143,7 @@ def _parse_entry(entry: ET.Element) -> dict[str, Any]:
         elif link.get("rel") == "alternate" and href:
             url = href
     if not pdf_url and paper_id:
-        pdf_url = f"http://arxiv.org/pdf/{paper_id}"
+        pdf_url = f"https://arxiv.org/pdf/{paper_id}"
 
     return {
         "id": paper_id,
@@ -189,14 +196,29 @@ def fetch_paper(identifier: str) -> dict[str, Any]:
         import httpx
 
         # One request, no retry loop — see the arXiv rate guidance note above.
-        response = httpx.get(
+        # Streamed so the byte cap applies before the body is buffered.
+        chunks: list[bytes] = []
+        received = 0
+        with httpx.stream(
+            "GET",
             url,
             timeout=REQUEST_TIMEOUT,
             headers={"User-Agent": USER_AGENT},
             follow_redirects=True,
-        )
-        response.raise_for_status()
-        body = response.text
+        ) as response:
+            response.raise_for_status()
+            for chunk in response.iter_bytes():
+                received += len(chunk)
+                if received > MAX_RESPONSE_BYTES:
+                    return {
+                        "error": (
+                            f"The arXiv response is over the {MAX_RESPONSE_BYTES} byte cap "
+                            "for a single-paper metadata query, so it was not read. Try "
+                            "again later or with a different identifier."
+                        )
+                    }
+                chunks.append(chunk)
+        body = b"".join(chunks).decode("utf-8", errors="replace")
     except Exception as exc:  # noqa: BLE001 - report, never raise, to the model
         return {
             "error": (

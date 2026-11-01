@@ -11,6 +11,8 @@ import { describe, expect, it } from 'vitest'
 import { fromQasm } from '@/lib/quantum'
 import {
   DEFAULT_NOISE,
+  MAX_NOISY_WORK,
+  MAX_PERSISTED_AMPLITUDES,
   describeTarget,
   parseTarget,
   runNoisy,
@@ -207,5 +209,37 @@ describe('runOnTarget', () => {
     const refused = await runOnTarget(BELL, { kind: 'hardware', backend: 'ibm_brisbane' }, { authorization: 'Bearer tok', hardware: refuse })
     expect(refused.ok).toBe(false)
     if (!refused.ok) expect(refused.error).toBe('Hardware submission refused (HTTP 402): Plan lacks hardware.real')
+  })
+})
+
+describe('runOnTarget — bounded output and work', () => {
+  const wide = (n: number) => HEADER + `qubit[${n}] q;\n` + Array.from({ length: n }, (_, i) => `h q[${i}];`).join('\n')
+
+  it('caps the persisted statevector: a 16-qubit uniform state keeps the largest amplitudes and says how many it dropped', async () => {
+    const ran = await runOnTarget(wide(16), { kind: 'simulator' }, { shots: 16, seed: 1 })
+    expect(ran.ok).toBe(true)
+    if (!ran.ok || ran.result.kind !== 'counts') return
+    expect(ran.result.statevector).toHaveLength(MAX_PERSISTED_AMPLITUDES)
+    expect(ran.result.statevectorOmitted).toBe(65_536 - MAX_PERSISTED_AMPLITUDES)
+    expect(JSON.stringify(ran.result).length).toBeLessThan(100_000)
+    const states = ran.result.statevector!.map((a) => a.state)
+    expect([...states].sort()).toEqual(states) // basis order
+  })
+
+  it('leaves a small state whole and adds no omitted marker', async () => {
+    const small = await runOnTarget(BELL, { kind: 'simulator' }, { shots: 8, seed: 1 })
+    if (small.ok && small.result.kind === 'counts') {
+      expect(small.result.statevectorOmitted).toBeUndefined()
+      expect(small.result.statevector).toHaveLength(2)
+    }
+  })
+
+  it('refuses a noisy run whose worst case would hold the event loop, and says how many shots would fit', async () => {
+    const lines = Array.from({ length: 400 }, () => 'h q[0];').join('\n')
+    const qasm = HEADER + 'qubit[10] q;\n' + lines
+    const ran = await runOnTarget(qasm, { kind: 'noisy-simulator', noise: DEFAULT_NOISE }, { shots: 4096 })
+    expect(ran.ok).toBe(false)
+    if (!ran.ok) expect(ran.error).toMatch(/too large.*at most \d+ shots/s)
+    expect(4096 * 400 * 2 ** 10).toBeGreaterThan(MAX_NOISY_WORK)
   })
 })

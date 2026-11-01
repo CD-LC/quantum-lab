@@ -26,6 +26,7 @@ import { NextResponse } from 'next/server'
 import { getEntitlement } from '@/lib/billing/entitlements'
 import { usagePeriodEnd } from '@/lib/billing/period'
 import { reconcileIfStale } from '@/lib/billing/reconcile'
+import { isStripeConfigured } from '@/lib/billing/stripe'
 import { isSupabaseConfigured } from '@/lib/supabase'
 import { verifiedCallerId } from '@/lib/security/auth'
 import { check, clientKey, retryHeaders } from '@/lib/security/ratelimit'
@@ -82,6 +83,13 @@ function payload(entitlement: Entitlement): Record<string, unknown> {
     // some unspecified future date" is a support ticket. `hardwareJobsUsed`
     // above is counted over exactly the window this closes.
     hardwareJobsResetAt: usagePeriodEnd(entitlement.currentPeriodEnd),
+    // Whether this deployment can sell or manage a subscription at all. The
+    // account page used to render "Manage billing" unconditionally and learn
+    // only on click — from the portal's `configured: false` — that there was
+    // nothing behind it, so on production (Stripe deliberately off) every
+    // signed-in user could read an operator message. With this the UI can
+    // leave the button out. Not a secret: /api/health says the same thing.
+    billingEnabled: isStripeConfigured,
   }
 }
 
@@ -146,7 +154,15 @@ export async function GET(req: Request): Promise<Response> {
     // free tier — a Stripe outage here cannot break the page. The cooldown and
     // the narrowness of the staleness test are in lib/billing/reconcile.ts;
     // both exist to bound Stripe calls, which are account-wide rate limited.
-    if (await reconcileIfStale(checked.value, entitlement.currentPeriodEnd)) {
+    // The stored status is passed so a lapsed ex-subscriber (canceled, whose
+    // period end is in the past for good) is not re-queried every cooldown.
+    const repaired = await reconcileIfStale(
+      checked.value,
+      entitlement.currentPeriodEnd,
+      new Date(),
+      entitlement.status
+    )
+    if (repaired) {
       return NextResponse.json(payload(await getEntitlement(checked.value)))
     }
     return NextResponse.json(payload(entitlement))

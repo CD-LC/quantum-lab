@@ -25,6 +25,8 @@ __all__ = [
     "debug_loop_guidance",
     "run_paper_guidance",
     "SETUP_MESSAGE",
+    "AgentStoppedError",
+    "is_force_stop_output",
 ]
 
 SETUP_MESSAGE: str = (
@@ -215,10 +217,22 @@ def _clean_override(llm: LlmOverride | None) -> LlmOverride | None:
     return out
 
 
+def _escape_template_braces(text: str) -> str:
+    """Escape ``{`` and ``}`` so a prompt template treats them as literal text.
+
+    ``ChatPromptTemplate`` parses every ``(role, string)`` message as an
+    f-string template. The system prompt embeds the learner's circuit, and QASM
+    is full of braces (``gate g a { h a; }``), each of which would be read as a
+    template variable and fail with a ``KeyError`` at invoke time.
+    """
+    return text.replace("{", "{{").replace("}", "}}")
+
+
 def build_agent(
     level: str = "beginner",
     circuit_qasm: str | None = None,
     llm_override: LlmOverride | None = None,
+    learner_plan: str | None = None,
 ) -> Any:
     """Construct a tool-calling ``AgentExecutor`` for a tutoring session.
 
@@ -268,6 +282,11 @@ def build_agent(
         "model": settings.model,
         "max_tokens": settings.max_tokens,
         "temperature": settings.temperature,
+        # LiteLLM's own default is 600 s per call; a stalled provider would pin
+        # a worker thread that long. Never longer than the run budget.
+        "request_timeout": min(
+            float(settings.llm_request_timeout), float(settings.max_agent_seconds)
+        ),
     }
     if override is not None:
         llm_kwargs["model"] = override["model"]
@@ -282,11 +301,15 @@ def build_agent(
         [
             (
                 "system",
-                build_system_prompt(level=level, circuit_qasm=circuit_qasm)
-                + "\n\n"
-                + debug_loop_guidance()
-                + "\n\n"
-                + run_paper_guidance(),
+                _escape_template_braces(
+                    build_system_prompt(
+                        level=level, circuit_qasm=circuit_qasm, learner_plan=learner_plan
+                    )
+                    + "\n\n"
+                    + debug_loop_guidance()
+                    + "\n\n"
+                    + run_paper_guidance()
+                ),
             ),
             MessagesPlaceholder("chat_history", optional=True),
             ("human", "{input}"),
@@ -331,12 +354,40 @@ def build_agent(
     )
 
 
+class AgentStoppedError(Exception):
+    """The executor hit its round or wall-clock limit and produced no answer.
+
+    Deliberately not a ``RuntimeError``: the server reads that as "not
+    configured" and answers 200 with setup text. This is a failed run, so it
+    surfaces as the 502 ``provider_error`` the web app already falls back on.
+    """
+
+
+#: LangChain's ``early_stopping_method="force"`` output when a run is cut off
+#: by ``max_iterations`` or ``max_execution_time``. It arrives as an ordinary
+#: ``output`` string, indistinguishable from an answer unless matched here.
+_FORCE_STOP_MARKER = "agent stopped due to iteration limit or time limit"
+
+
+def is_force_stop_output(output: str) -> bool:
+    """Whether an executor output is its force-stop sentinel, not an answer.
+
+    Args:
+        output: The executor's final output text.
+
+    Returns:
+        True when the text is the "stopped due to iteration or time limit" message.
+    """
+    return output.strip().lower().startswith(_FORCE_STOP_MARKER)
+
+
 def ask(
     question: str,
     level: str = "beginner",
     history: list[dict[str, str]] | None = None,
     circuit_qasm: str | None = None,
     llm_override: LlmOverride | None = None,
+    learner_plan: str | None = None,
 ) -> dict[str, Any]:
     """Ask QuantumMind a question and get its reply plus the tools it used.
 
@@ -346,6 +397,8 @@ def ask(
         history: Prior turns as ``{"role": "user"|"assistant", "content": str}``
             dicts, oldest first.
         circuit_qasm: OpenQASM the learner currently has open, if any.
+        llm_override: Provider/key choice forwarded by the web app, if any.
+        learner_plan: Study plan the learner opted in to sharing, if any.
 
     Returns:
         ``{"reply": str, "tools_used": list[str]}``.
@@ -353,8 +406,15 @@ def ask(
     Raises:
         RuntimeError: If the service is not configured (no API key or missing
             LangChain dependencies).
+        AgentStoppedError: If the run hit its round or time limit and so has no
+            real answer to return.
     """
-    executor = build_agent(level=level, circuit_qasm=circuit_qasm, llm_override=llm_override)
+    executor = build_agent(
+        level=level,
+        circuit_qasm=circuit_qasm,
+        llm_override=llm_override,
+        learner_plan=clamp_text(learner_plan) if learner_plan else None,
+    )
 
     from langchain_core.messages import AIMessage, HumanMessage
 
@@ -390,4 +450,8 @@ def ask(
             block.get("text", "") if isinstance(block, dict) else str(block) for block in output
         )
 
-    return {"reply": str(output).strip(), "tools_used": tools_used}
+    reply = str(output).strip()
+    if is_force_stop_output(reply):
+        raise AgentStoppedError("agent run stopped at its iteration or time limit")
+
+    return {"reply": reply, "tools_used": tools_used}

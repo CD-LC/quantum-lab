@@ -20,12 +20,13 @@
  */
 
 import { NextResponse } from 'next/server'
-import { sendEmail } from '@/lib/email/client'
+import { NOT_CONFIGURED_REASON, sendEmail } from '@/lib/email/client'
+import { reportError } from '@/lib/observability/report'
 import { examPassed, magicLink, orgInvite, welcome, type EmailContent } from '@/lib/email/templates'
 import { INVITE_TTL_DAYS } from '@/lib/orgs/invites'
 import { APP_URL } from '@/lib/billing/stripe'
 import { SIGN_IN_REQUIRED, verifiedCaller } from '@/lib/security/auth'
-import { httpUrl, safeJson } from '@/lib/security/validate'
+import { httpUrl, readJsonBody } from '@/lib/security/validate'
 import { callerKey, rateLimit, retryAfterHeaders } from '@/lib/rateLimit'
 import type { ApiErrorBody } from '@/lib/apiError'
 
@@ -48,6 +49,13 @@ export const runtime = 'nodejs'
 
 const MAX_PER_MINUTE = 5
 const MAX_PER_DAY = 100
+
+/**
+ * What a caller is told when the provider refuses or is unreachable. Fixed on
+ * purpose — see the end of POST. Not exported: a route module may only export
+ * handlers and segment config, so lib/email/route.test.ts asserts the literal.
+ */
+const SEND_FAILED_REASON = 'The message could not be sent right now.'
 
 // ── request shape ─────────────────────────────────────────────
 
@@ -208,7 +216,13 @@ export async function POST(request: Request): Promise<NextResponse> {
   }
 
   // SECURITY FIX (audit finding VAL-1): cap the body before parsing it.
-  const parsed = safeJson(await request.text(), 32_768)
+  const parsed = await readJsonBody(request, 32_768)
+  if (!parsed.ok && parsed.tooLarge) {
+    return NextResponse.json(
+      { sent: false, error: parsed.error, code: 'payload_too_large' },
+      { status: 413 }
+    )
+  }
   if (!parsed.ok) return bad(parsed.error)
   const body: unknown = parsed.value
   if (!isRecord(body)) return bad('Expected an object of the shape { type, to, data }.')
@@ -283,7 +297,19 @@ export async function POST(request: Request): Promise<NextResponse> {
     text: content.text,
   })
 
-  return NextResponse.json(
-    result.sent ? { sent: true, id: result.id } : { sent: false, reason: result.reason }
-  )
+  if (result.sent) return NextResponse.json({ sent: true, id: result.id })
+
+  // CONFIG-LEAK FIX: `reason` used to be the provider's own error text —
+  // "API key is invalid", "domain is not verified", a fetch error naming the
+  // upstream host. That is operator configuration state, and any signed-in
+  // user could read it here (the same class of leak LEAK-1 closed on the
+  // billing and analytics routes). It goes to the error reporter, where an
+  // operator can act on it; the caller gets a fixed sentence. The one reason
+  // still echoed is NOT_CONFIGURED_REASON, which is the app's own copy and
+  // what the zero-config developer flow reads.
+  if (result.reason === NOT_CONFIGURED_REASON) {
+    return NextResponse.json({ sent: false, reason: result.reason })
+  }
+  reportError(new Error(result.reason), { scope: 'api.email', what: 'send', type: body.type })
+  return NextResponse.json({ sent: false, reason: SEND_FAILED_REASON })
 }

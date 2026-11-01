@@ -157,8 +157,91 @@ describe('runCourseDispatch', () => {
       now: NOW,
       store,
       send: sender.send,
+      sleep: async () => {},
     })
     expect(report.examined).toBe(3)
     expect(report.sent).toBe(3)
+  })
+
+  describe('transient provider failures', () => {
+    function scriptedSend(log: string[], script: SendResult[]) {
+      let i = 0
+      return async (input: SendEmailInput): Promise<SendResult> => {
+        log.push(`send:${input.to}`)
+        return script[Math.min(i++, script.length - 1)]
+      }
+    }
+
+    it('retries a 429/5xx with backoff and the day stays claimed on success', async () => {
+      const { store, log } = fakeStore([candidate()])
+      const sleeps: number[] = []
+      const report = await runCourseDispatch({
+        limit: 1,
+        baseUrl: 'https://app.test',
+        now: NOW,
+        store,
+        send: scriptedSend(log, [
+          { sent: false, reason: 'rate limited', retryable: true },
+          { sent: true, id: 'msg_2' },
+        ]),
+        sleep: async (ms) => void sleeps.push(ms),
+      })
+      expect(report).toMatchObject({ sent: 1, failures: [] })
+      expect(log.filter((e) => e.startsWith('send:'))).toHaveLength(2)
+      expect(sleeps).toEqual([1_000])
+    })
+
+    it('releases the claim when the provider keeps refusing, so the next pass resends', async () => {
+      const { store, log } = fakeStore([candidate()])
+      store.releaseDay = async (cand, day) => void log.push(`release:${cand.id}:day${day}`)
+      const report = await runCourseDispatch({
+        limit: 1,
+        baseUrl: 'https://app.test',
+        now: NOW,
+        store,
+        send: scriptedSend(log, [{ sent: false, reason: 'down', retryable: true }]),
+        sleep: async () => {},
+      })
+      expect(report.sent).toBe(0)
+      expect(report.failures).toEqual([
+        { subscriptionId: 'sub-1', day: 1, reason: 'down', released: true },
+      ])
+      expect(log.at(-1)).toBe('release:sub-1:day1')
+      expect(log.filter((e) => e.startsWith('send:'))).toHaveLength(3)
+    })
+
+    it('keeps the claim (no retry, no release) for an ambiguous failure', async () => {
+      const { store, log } = fakeStore([candidate()])
+      store.releaseDay = async () => void log.push('release')
+      const report = await runCourseDispatch({
+        limit: 1,
+        baseUrl: 'https://app.test',
+        now: NOW,
+        store,
+        send: scriptedSend(log, [{ sent: false, reason: 'socket hang up' }]),
+        sleep: async () => {},
+      })
+      expect(report.failures).toHaveLength(1)
+      expect(report.failures[0].released).toBeUndefined()
+      expect(log).not.toContain('release')
+      expect(log.filter((e) => e.startsWith('send:'))).toHaveLength(1)
+    })
+
+    it('paces consecutive sends', async () => {
+      const { store, log } = fakeStore([
+        candidate({ id: 'a', email: 'a@example.com' }),
+        candidate({ id: 'b', email: 'b@example.com' }),
+      ])
+      const sleeps: number[] = []
+      await runCourseDispatch({
+        limit: 2,
+        baseUrl: 'https://app.test',
+        now: NOW,
+        store,
+        send: fakeSend(log).send,
+        sleep: async (ms) => void sleeps.push(ms),
+      })
+      expect(sleeps).toEqual([500])
+    })
   })
 })

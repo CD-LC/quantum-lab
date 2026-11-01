@@ -85,7 +85,9 @@ import {
   readJsonObject,
   requireCaller,
   MAX_SHOTS,
+  outcomeUnknown,
   SUBMIT_LIMIT,
+  SUBMIT_TIMEOUT_MS,
 } from '@/lib/hardware/proxy'
 import { requireFeature } from '@/lib/billing/entitlements'
 import { usagePeriodStart } from '@/lib/billing/period'
@@ -371,7 +373,10 @@ export async function POST(req: Request): Promise<Response> {
     undefined,
     // The credential, if any, travels as a header on THIS request and is never
     // written anywhere. `forward` attaches it; nothing here logs it.
-    credential
+    credential,
+    // A job submission is slow upstream (it transpiles and enqueues before it
+    // answers), so it gets a longer timeout than a read.
+    { timeoutMs: SUBMIT_TIMEOUT_MS }
   )
 
   // Best-effort, and deliberately not awaited before the response is settled:
@@ -383,8 +388,17 @@ export async function POST(req: Request): Promise<Response> {
   // 8 ── settle the reservation against what actually happened upstream.
   const accepted = response.status >= 200 && response.status < 300
   if (!accepted) {
-    // Upstream refused, or was unreachable (`forward` turns that into its own
-    // 504). No job exists, so no allowance was spent.
+    if (outcomeUnknown(response)) {
+      // The request was sent and no answer came back in time. The upstream
+      // handler is synchronous and an aborted connection does not cancel it, so
+      // the job may well be enqueued. Releasing the reservation here would give
+      // a free vendor job (and leave an untracked one). Keep the row, mark it
+      // unmatched for reconciliation, and say so honestly.
+      return unknownOutcomeJob(reservation)
+    }
+    // Upstream refused, or could not be reached at all (`forward` turns that
+    // into its own 504 without the outcome header). No job exists, so no
+    // allowance was spent.
     await releaseHardwareJob(reservation)
     return response
   }
@@ -604,6 +618,24 @@ async function reserveByokJob(
  * If this fires more than rarely, the bug is upstream in `services/api`'s
  * hardware dispatcher and this route is the wrong place to fix it.
  */
+/**
+ * The upstream did not answer within the submit timeout. The job may be
+ * running at the provider, so the usage row is kept (counted against the
+ * allowance) and marked unmatched rather than refunded.
+ */
+async function unknownOutcomeJob(reservation: HardwareReservation): Promise<Response> {
+  console.error(
+    `[api/hardware/submit] upstream timed out; usage row ${reservation.id} kept and ` +
+      'marked unmatched because the job may have been enqueued.'
+  )
+  await markHardwareJobUnmatched(reservation, null)
+  const detail =
+    'The provider did not confirm this submission in time, so the job may still be running. ' +
+    'It has been counted against your allowance until it can be checked — look at your job ' +
+    'history in a few minutes before submitting it again.'
+  return NextResponse.json({ detail, error: detail, offline: false, unknownOutcome: true }, { status: 504 })
+}
+
 async function unmatchedJob(
   reservation: HardwareReservation,
   provider: string | null

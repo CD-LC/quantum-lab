@@ -8,7 +8,7 @@
  */
 
 import Link from 'next/link'
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import AuthPanel from '@/components/auth/AuthPanel'
 import PlatformConsoleLink from '@/components/admin/PlatformConsoleLink'
 import { useSession } from '@/components/auth/useSession'
@@ -16,6 +16,7 @@ import { PlanBadge } from '@/components/billing/PlanBadge'
 import { useEntitlement } from '@/components/billing/useEntitlement'
 import { formatLimit, type Entitlement, type Plan, type SubscriptionStatus } from '@/lib/plans'
 import { authFetch } from '@/lib/authFetch'
+import { startConfirmingCheckout } from '@/lib/billing/confirmCheckout'
 import { ApiKeys } from '@/components/account/ApiKeys'
 import { ProviderCredentials } from '@/components/account/ProviderCredentials'
 
@@ -54,7 +55,7 @@ function formatDate(iso: string | undefined): string | null {
 
 export default function AccountPage() {
   const { user } = useSession()
-  const { entitlement, plan, loading, refresh } = useEntitlement()
+  const { entitlement, plan, loading, billingEnabled, refresh } = useEntitlement()
   const [checkoutSuccess, setCheckoutSuccess] = useState(false)
 
   useEffect(() => {
@@ -65,18 +66,29 @@ export default function AccountPage() {
 
   // Arriving back from Stripe checkout is not the same as the subscription
   // being active yet — the webhook that updates the entitlement can lag a few
-  // seconds behind the redirect. Poll until the entitlement itself reports a
-  // paid plan (or we give up), rather than asserting "Pro" from the URL alone.
-  const stillConfirming = checkoutSuccess && !loading && plan.id === 'free'
+  // seconds behind the redirect, or never arrive. So rather than only polling
+  // the entitlement, ask the server to reconcile with Stripe and then re-read
+  // it, with backoff, until the entitlement itself reports a paid plan (or the
+  // schedule runs out). Never asserts "Pro" from the URL alone.
+  const planIdRef = useRef(plan.id)
   useEffect(() => {
-    if (!stillConfirming) return
-    const interval = window.setInterval(() => refresh(), 3000)
-    const timeout = window.setTimeout(() => window.clearInterval(interval), 30000)
-    return () => {
-      window.clearInterval(interval)
-      window.clearTimeout(timeout)
-    }
-  }, [stillConfirming, refresh])
+    planIdRef.current = plan.id
+  }, [plan.id])
+  const userId = user?.id
+  useEffect(() => {
+    if (!checkoutSuccess || !userId) return
+    return startConfirmingCheckout({
+      reconcile: async () => {
+        await authFetch('/api/billing/reconcile', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ userId }),
+        })
+      },
+      refresh,
+      isPaid: () => planIdRef.current !== 'free',
+    })
+  }, [checkoutSuccess, userId, refresh])
 
   return (
     <div className="mx-auto max-w-4xl px-6 py-12">
@@ -130,6 +142,7 @@ export default function AccountPage() {
         loading={loading}
         userId={user?.id}
         signedIn={!!user}
+        billingEnabled={billingEnabled}
       />
 
       <UsageCard entitlement={entitlement} plan={plan} signedIn={!!user} />
@@ -159,12 +172,14 @@ function PlanCard({
   loading,
   userId,
   signedIn,
+  billingEnabled,
 }: {
   entitlement: Entitlement
   plan: Plan
   loading: boolean
   userId?: string
   signedIn: boolean
+  billingEnabled: boolean
 }) {
   const [portalState, setPortalState] = useState<
     { kind: 'idle' | 'pending' } | { kind: 'notice' | 'error'; message: string }
@@ -252,14 +267,21 @@ function PlanCard({
       ) : null}
 
       <div className="mt-4 flex flex-wrap gap-2">
-        <button
-          type="button"
-          className="btn-ghost focus-ring"
-          disabled={portalState.kind === 'pending'}
-          onClick={() => void openPortal()}
-        >
-          {portalState.kind === 'pending' ? 'Opening…' : 'Manage billing'}
-        </button>
+        {/* Only where there is a portal to open (billing is on and the caller is
+            signed in), and never inside the store apps: the portal allows plan
+            changes, an outside purchase path Google Play and the App Store
+            refuse (docs/BILLING.md, "Store apps"). */}
+        {billingEnabled ? (
+          <button
+            type="button"
+            data-store-hide
+            className="btn-ghost focus-ring"
+            disabled={portalState.kind === 'pending'}
+            onClick={() => void openPortal()}
+          >
+            {portalState.kind === 'pending' ? 'Opening…' : 'Manage billing'}
+          </button>
+        ) : null}
         <Link href="/pricing" className="btn-ghost focus-ring">
           Compare plans
         </Link>
@@ -271,6 +293,7 @@ function PlanCard({
       {portalState.kind === 'notice' ? (
         <p
           role="status"
+          data-store-hide
           className="mt-3 rounded-lg border border-q-amber/30 px-3 py-2 text-[12px] leading-relaxed"
           style={AMBER_BOX}
         >
@@ -278,7 +301,7 @@ function PlanCard({
         </p>
       ) : null}
       {portalState.kind === 'error' ? (
-        <p role="alert" className="mt-3 text-[12px] text-q-rose-text">
+        <p role="alert" data-store-hide className="mt-3 text-[12px] text-q-rose-text">
           {portalState.message}
         </p>
       ) : null}

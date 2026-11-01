@@ -286,7 +286,7 @@ export default function ChatPanel({ circuitQasm, initialInput, level, className 
         },
       ])
     } catch {
-      setError('Could not reach the tutor. Check that the dev server is running, then try again.')
+      setError('Could not reach the tutor. Check your connection and try again.')
     } finally {
       setLoading(false)
     }

@@ -235,8 +235,20 @@ def _run_quantum_circuit_impl(
         one-line human sentence naming the two most frequent outcomes. On
         failure it returns ``{"error": <message>}`` instead of raising.
     """
-    if not qasm or not qasm.strip():
+    if not qasm or not str(qasm).strip():
         return {"error": "No QASM source was provided, so there is nothing to run."}
+
+    qasm = str(qasm)
+    qasm_limit = max(1, int(settings.max_qasm_chars))
+    if len(qasm) > qasm_limit:
+        # Rejected rather than truncated: a truncated circuit is a different
+        # circuit, and the learner would be told what it measured.
+        return {
+            "error": (
+                f"The QASM is {len(qasm)} characters, over the {qasm_limit} character "
+                "limit for running a circuit. Shorten it or run a smaller version."
+            )
+        }
 
     # SECURITY FIX (audit finding INJ-1): bound before anything is spent. See
     # clamp_shots — the old `max(1, int(shots))` had no ceiling at all, and the
@@ -251,7 +263,9 @@ def _run_quantum_circuit_impl(
         response = httpx.post(
             url,
             json={"qasm": qasm, "shots": shots, "backend": backend},
-            timeout=30.0,
+            # Bounded by the run budget: a tool call cannot be interrupted from
+            # outside, so its own timeout is what keeps a run inside it.
+            timeout=min(30.0, max(1.0, float(settings.max_agent_seconds))),
         )
         response.raise_for_status()
         payload = response.json()
@@ -274,12 +288,18 @@ def _run_quantum_circuit_impl(
         from qiskit import transpile
         from qiskit_aer import AerSimulator
 
+        width_refusal = _register_width_refusal(qasm, int(settings.max_qubits))
+        if width_refusal is not None:
+            return {"error": width_refusal}
         circuit = _parse_qasm(qiskit, qasm)
+        refusal = _local_run_refusal(circuit, shots)
+        if refusal is not None:
+            return {"error": refusal}
         if circuit.num_clbits == 0:
             circuit = circuit.copy()
             circuit.measure_all()
 
-        simulator = AerSimulator()
+        simulator = AerSimulator(max_memory_mb=max(1, int(settings.sim_max_memory_mb)))
         compiled = transpile(circuit, simulator)
         result = simulator.run(compiled, shots=shots).result()
         raw_counts = result.get_counts()
@@ -298,6 +318,151 @@ def _run_quantum_circuit_impl(
                 "Check the QASM with check_circuit."
             )
         }
+
+
+#: Operations whose presence makes Aer re-simulate every shot instead of
+#: sampling one final statevector.
+_DYNAMIC_OPS = frozenset({"reset", "if_else", "while_loop", "for_loop", "switch_case"})
+
+
+def _expanded_gate_count(circuit: Any, ceiling: int) -> int:
+    """Count gates after custom ``gate`` definitions are expanded.
+
+    ``QuantumCircuit.size()`` counts a call to a user-defined gate as one
+    instruction, but ``transpile`` expands it, so ``gate g1 a { g0 a; g0 a; }``
+    nested 14 deep is 479 characters that become 2^14 gates (and 2^17 never
+    finishes). Standard-library gates are leaves. Counting stops as soon as the
+    total passes ``ceiling``, so the check itself is cheap.
+
+    Args:
+        circuit: A parsed ``QuantumCircuit``.
+        ceiling: Stop counting once the total exceeds this.
+
+    Returns:
+        The expanded gate count, or a value above ``ceiling`` if it is over it.
+    """
+    from qiskit.circuit.library.standard_gates import get_standard_gate_name_mapping
+
+    standard = get_standard_gate_name_mapping()
+    memo: dict[tuple[str, int], int] = {}
+
+    def count_op(op: Any, depth: int) -> int:
+        name = getattr(op, "name", "")
+        if name in standard or depth > 64:
+            return 1
+        try:
+            definition = getattr(op, "definition", None)
+        except Exception:  # noqa: BLE001 - an op with no usable definition is a leaf
+            definition = None
+        if definition is None:
+            return 1
+        key = (name, getattr(op, "num_qubits", 0))
+        if key in memo:
+            return memo[key]
+        total = 0
+        for inner in definition.data:
+            total += count_op(inner.operation, depth + 1)
+            if total > ceiling:
+                break
+        memo[key] = total
+        return total
+
+    grand = 0
+    for instruction in circuit.data:
+        grand += count_op(instruction.operation, 0)
+        if grand > ceiling:
+            break
+    return grand
+
+
+#: Register declarations in either QASM dialect, capturing the size as ANY text
+#: up to the bracket: OpenQASM 3 also accepts ``4_000_000``, ``0x3D0900`` and
+#: ``2000000*2``, which a digits-only pattern skips entirely.
+_REGISTER_SIZE_RE = re.compile(
+    r"\b(?:qubit|bit)\s*\[([^\]]*)\]|\b[qc]reg\s+\w+\s*\[([^\]]*)\]", re.IGNORECASE
+)
+
+
+def _register_width_refusal(qasm: str, limit: int) -> str | None:
+    """Refuse a circuit that DECLARES a register wider than ``limit``, pre-parse.
+
+    Parsing ``qubit[4_000_000] q;`` builds a 4-million-qubit circuit before any
+    post-parse check can look at it, so the width is checked on the source text.
+    A size that is not a short plain decimal (underscores, hex, an expression)
+    cannot be evaluated cheaply and is treated as over the limit.
+
+    Args:
+        qasm: The QASM source.
+        limit: Largest register size accepted.
+
+    Returns:
+        An explanation for the model, or ``None`` if every register is within it.
+    """
+    for match in _REGISTER_SIZE_RE.finditer(qasm):
+        size = (match.group(1) if match.group(1) is not None else match.group(2)).strip()
+        declared = int(size) if re.fullmatch(r"\d{1,9}", size) else limit + 1
+        if declared > limit:
+            return (
+                f"A register is declared wider than {limit} qubits (or with a size "
+                "that cannot be checked); this tool is limited to "
+                f"{limit}. Use a smaller instance of the circuit."
+            )
+    return None
+
+
+def _local_run_refusal(circuit: Any, shots: int) -> str | None:
+    """Decide whether a circuit is too big to simulate in this process.
+
+    SECURITY / RELIABILITY. This is the local fallback inside a small container
+    shared by every user, and a running Aer call cannot be interrupted, so the
+    limits are enforced up front: qubit count (a statevector is 2^n amplitudes),
+    expanded gate count (see :func:`_expanded_gate_count`), and an estimate of
+    total work that multiplies in the shot count when the circuit measures
+    mid-circuit or resets and Aer therefore simulates every shot separately.
+
+    Args:
+        circuit: A parsed ``QuantumCircuit``.
+        shots: The already-clamped shot count.
+
+    Returns:
+        An explanation to hand back to the model, or ``None`` if the circuit is fine.
+    """
+    max_qubits = max(1, int(settings.max_qubits))
+    if circuit.num_qubits > max_qubits:
+        return (
+            f"This circuit uses {circuit.num_qubits} qubits; the local simulator is "
+            f"limited to {max_qubits}. Use a smaller instance of the circuit."
+        )
+
+    max_gates = max(1, int(settings.max_circuit_gates))
+    gates = _expanded_gate_count(circuit, max_gates)
+    if gates > max_gates:
+        return (
+            f"This circuit expands to more than {max_gates} gates once its custom "
+            "gate definitions are unrolled, which is too large to simulate here."
+        )
+
+    dynamic = False
+    seen_measure = False
+    for instruction in circuit.data:
+        name = instruction.operation.name
+        if name in _DYNAMIC_OPS:
+            dynamic = True
+            break
+        if name == "measure":
+            seen_measure = True
+        elif name != "barrier" and seen_measure:
+            dynamic = True
+            break
+    work = max(1, gates) * (2**circuit.num_qubits) * (shots if dynamic else 1)
+    if work > int(settings.max_sim_work):
+        return (
+            "This circuit is too expensive to simulate here "
+            f"({circuit.num_qubits} qubits, about {gates} gates"
+            + (f", {shots} shots re-simulated one by one" if dynamic else "")
+            + "). Reduce the qubit count, gate count or shots."
+        )
+    return None
 
 
 def _generate_circuit_impl(description: str) -> dict[str, Any]:
@@ -358,7 +523,17 @@ def _explain_measurement_impl(counts: dict[str, int], qasm: str = "") -> str:
             "`c = measure q;`) and run it again."
         )
 
-    clean = {str(k).replace(" ", ""): int(v) for k, v in counts.items() if int(v) > 0}
+    clean: dict[str, int] = {}
+    if isinstance(counts, dict):
+        for key, raw in counts.items():
+            # The model supplies these; a non-numeric value ("lots") must be
+            # skipped, not abort the whole run with a ValueError.
+            try:
+                value = int(float(raw))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if value > 0:
+                clean[str(key).replace(" ", "")] = value
     if not clean:
         return (
             "Every recorded outcome has a count of zero, so there is nothing to "
@@ -478,8 +653,11 @@ def _check_circuit_impl(qasm: str) -> str:
         A numbered list of findings, or ``"No problems found."`` followed by a
         one-line description of the circuit when it is clean.
     """
-    if not qasm or not qasm.strip():
+    if not qasm or not str(qasm).strip():
         return "1. The QASM source is empty, so there is no circuit to analyse."
+
+    # Bound the model-supplied source like _inspect_statevector_impl does.
+    qasm = str(qasm)[: max(1, int(settings.max_message_chars))]
 
     lines = [line.split("//")[0].strip() for line in qasm.splitlines()]
     lines = [line for line in lines if line]
@@ -612,6 +790,9 @@ def _inspect_statevector_impl(qasm: str, max_steps: int = MAX_INSPECT_STEPS) -> 
         import qiskit
         from qiskit.quantum_info import Operator, Statevector
 
+        width_refusal = _register_width_refusal(qasm, MAX_INSPECT_QUBITS)
+        if width_refusal is not None:
+            return {"error": width_refusal}
         circuit = _parse_qasm(qiskit, qasm)
     except Exception as exc:  # noqa: BLE001 - report, never raise, to the model
         return {
@@ -1353,6 +1534,25 @@ def _gate_name(line: str) -> str | None:
     return match.group(1)
 
 
+#: Ceiling on a declared register size for the STATIC checks. check_circuit
+#: builds ``set(range(num_qubits))`` for a whole-register gate, so an unclamped
+#: ``qubit[400000000] q; h q;`` allocated gigabytes in a 0.5 GiB container. No
+#: real device has more than a few hundred qubits.
+MAX_DECLARED_QUBITS: int = 4096
+
+
+def _bounded_int(digits: str) -> int:
+    """Parse a run of digits from QASM, saturating instead of failing.
+
+    ``int()`` raises ``ValueError`` on more than 4300 digits (Python 3.11+), and
+    a huge value is only ever used to size a range, so it saturates at
+    :data:`MAX_DECLARED_QUBITS` + 1.
+    """
+    if len(digits) > 9:
+        return MAX_DECLARED_QUBITS + 1
+    return min(int(digits), MAX_DECLARED_QUBITS + 1)
+
+
 def _declared_qubits(qasm: str) -> tuple[int, set[str]]:
     """Determine how many qubits are declared and under which register names.
 
@@ -1365,15 +1565,17 @@ def _declared_qubits(qasm: str) -> tuple[int, set[str]]:
     total = 0
     names: set[str] = set()
     for match in _QUBIT_DECL_RE.finditer(qasm):
-        total += int(match.group(1))
+        total += _bounded_int(match.group(1))
         names.add(match.group(2))
     for match in _QREG_DECL_RE.finditer(qasm):
-        total += int(match.group(2))
+        total += _bounded_int(match.group(2))
         names.add(match.group(1))
     for match in re.finditer(r"^\s*qubit\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*;", qasm, re.MULTILINE):
         total += 1
         names.add(match.group(1))
-    return total, names
+    # Clamped as well as each term: this is only ever used to size sets and
+    # ranges for the static checks, so a real circuit is never affected.
+    return min(total, MAX_DECLARED_QUBITS), names
 
 
 def _ordered_qubit_indices(line: str) -> list[int]:
@@ -1385,7 +1587,11 @@ def _ordered_qubit_indices(line: str) -> list[int]:
     Returns:
         The integer indices in the order they appear.
     """
-    return [int(m.group(2)) for m in _INDEX_RE.finditer(line)]
+    # Saturating, so a 5000-digit "index" cannot raise ValueError; nothing is
+    # allocated from these, so no tighter cap is needed.
+    return [
+        int(m.group(2)) if len(m.group(2)) <= 18 else 10**18 for m in _INDEX_RE.finditer(line)
+    ]
 
 
 def _referenced_qubits(
@@ -1425,16 +1631,16 @@ def _referenced_qubits(
 def _get_learner_profile_impl(progress: dict[str, Any] | None = None) -> dict[str, Any]:
     """Read the learner's course progress to personalise an answer.
 
-    The caller passes the progress payload; call this before recommending what
-    to study next or judging how deep to pitch an explanation. Progress lives in
-    the learner's browser, so the web route forwards it with the request — this
-    tool never reaches into a browser and never invents progress it was not
-    given.
+    Progress lives in the learner's browser and is NOT forwarded to this tool.
+    If the learner opted in to sharing a study plan, it is already in your
+    system prompt; use that. Only pass ``progress`` if the learner pasted a
+    progress object into the conversation themselves — never construct one,
+    guess one, or fill in scores they have not told you about.
 
     Args:
-        progress: The learner's ``quantum-lab.progress`` object as forwarded by
-            the caller, optionally carrying an ``examAttempts`` history. Pass
-            ``None`` when the request arrived without one.
+        progress: A ``quantum-lab.progress`` object the learner supplied in the
+            conversation, optionally carrying an ``examAttempts`` history. Pass
+            ``None`` otherwise (the normal case).
 
     Returns:
         A dict with ``available`` (bool), ``completed``, ``quiz_scores``,
@@ -1617,8 +1823,10 @@ def _recommend_next_lesson_impl(
     prefers revision of a shaky lesson over advancing to a new one.
 
     Args:
-        progress: The learner's progress payload as forwarded by the caller, or
-            ``None`` for a learner with no recorded progress.
+        progress: A progress payload the learner pasted into the conversation,
+            or ``None`` (the normal case: progress is not forwarded to this
+            tool, and you must never invent one). A shared study plan, if any,
+            is in your system prompt.
         goal: What the learner said they want to understand, in their own words.
             Optional.
 
@@ -2841,7 +3049,19 @@ def _named(func: Any, name: str) -> Any:
 
     @functools.wraps(func)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
-        return func(*args, **kwargs)
+        # A tool exception would abort the whole agent run (LangChain re-raises
+        # it) and surface as an HTTP 500. Hand the failure back to the model as
+        # text instead, so it can recover or tell the learner. Class name only:
+        # the message may echo the learner's input.
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - see above
+            return {
+                "error": (
+                    f"The {name} tool failed ({type(exc).__name__}). Check the "
+                    "arguments, or answer without this tool."
+                )
+            }
 
     wrapper.__name__ = name
     wrapper.__qualname__ = name

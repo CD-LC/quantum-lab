@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server'
 import { APICallError, generateText, type LanguageModel } from 'ai'
 import { callerKey, rateLimit, retryAfterHeaders } from '@/lib/rateLimit'
-import { arr, isRecord, safeJson, str } from '@/lib/security/validate'
+import { arr, isRecord, readJsonBody, str } from '@/lib/security/validate'
 import { badRequest } from '@/lib/apiError'
 import { reportError } from '@/lib/observability/report'
 // Tier 3. Extracted so services/agent/eval/ can grade the real matcher
@@ -9,7 +9,7 @@ import { reportError } from '@/lib/observability/report'
 import { OFFLINE_NOTE, offlineReply } from './offlineFaq'
 import { verifiedCaller } from '@/lib/security/auth'
 import { getEntitlement } from '@/lib/billing/entitlements'
-import { buildLanguageModel } from '@/lib/llm/model'
+import { buildLanguageModel, llmTimeoutSignal } from '@/lib/llm/model'
 import { effectiveLlmSettings, envLlmSettings } from '@/lib/platform/settings'
 import type { TierId } from '@/lib/platform/llmConfig'
 import {
@@ -365,7 +365,25 @@ async function tryAgentService(
       cache: 'no-store',
     })
 
-    if (!res.ok) return null
+    if (!res.ok) {
+      // The agent service answers a provider failure with 502
+      // {detail:{error:'provider_error',type}}. The learner still gets tier 2 /
+      // the offline FAQ, but the operator must see that the tutor degraded:
+      // silently returning null is how a dead agent went unnoticed.
+      let detail: unknown = null
+      try {
+        detail = ((await res.json()) as { detail?: unknown } | null)?.detail ?? null
+      } catch {
+        /* non-JSON error body (proxy 502/503 page) — the status is enough. */
+      }
+      reportError(new Error(`agent service returned HTTP ${res.status}`), {
+        route: 'api/agent',
+        stage: 'agent-service',
+        status: res.status,
+        detail: typeof detail === 'string' ? detail.slice(0, 200) : detail,
+      })
+      return null
+    }
 
     const data = (await res.json()) as AgentChatResponse
     if (data.configured === false) return null
@@ -378,7 +396,16 @@ async function tryAgentService(
       : []
 
     return { reply, toolsUsed }
-  } catch {
+  } catch (err) {
+    // An abort is the AGENT_TIMEOUT_MS timer firing (a cold or hung agent);
+    // anything else is a network failure. Both fall through to tier 2, and
+    // both are reported so they are visible.
+    const timedOut = controller.signal.aborted
+    reportError(err, {
+      route: 'api/agent',
+      stage: timedOut ? 'agent-service-timeout' : 'agent-service-network',
+      timeoutMs: timedOut ? AGENT_TIMEOUT_MS : undefined,
+    })
     return null
   } finally {
     clearTimeout(timer)
@@ -493,11 +520,16 @@ export async function POST(req: Request): Promise<Response> {
 
     let body: AgentRequestBody
     {
-      // SECURITY FIX (audit finding VAL-1): read as text and cap the byte size
-      // before parsing. `await req.json()` on an unbounded body parses whatever
-      // arrives and allocates the result on top of it.
-      const parsed = safeJson(await req.text(), MAX_BODY_BYTES)
-      if (!parsed.ok) return badRequest(parsed.error)
+      // SECURITY FIX (audit finding VAL-1): the byte cap is enforced WHILE
+      // READING (Content-Length pre-check, then a streaming reader with a
+      // running total). `await req.text()` first would buffer an unbounded
+      // body in full before any cap could apply.
+      const parsed = await readJsonBody(req, MAX_BODY_BYTES)
+      if (!parsed.ok) {
+        return parsed.tooLarge
+          ? NextResponse.json({ error: parsed.error }, { status: 413 })
+          : badRequest(parsed.error)
+      }
       if (!isRecord(parsed.value)) return badRequest('Request body must be a JSON object.')
       const rec = parsed.value
       const level =
@@ -662,6 +694,10 @@ export async function POST(req: Request): Promise<Response> {
         messages,
         // SECURITY (audit finding INJ-1): bounded output, see MAX_REPLY_TOKENS.
         maxOutputTokens: MAX_REPLY_TOKENS,
+        // A provider that hangs instead of erroring must not pin this request
+        // (and the single web replica) open: on timeout this throws a
+        // non-APICallError, which lands in the offline fallback below.
+        abortSignal: llmTimeoutSignal(),
       })
       const reply = result.text.trim()
 

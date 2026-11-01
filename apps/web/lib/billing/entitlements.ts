@@ -20,6 +20,7 @@ import {
   type Entitlement,
   type FeatureId,
   type FeatureLockedError,
+  PLAN_BY_ID,
   type PlanId,
   type SubscriptionStatus,
 } from '@/lib/plans'
@@ -90,8 +91,8 @@ function readClient(): SupabaseClient | null {
 
 const PLAN_RANK: Record<PlanId, number> = { free: 0, pro: 1, team: 2, edu: 3 }
 
-function stronger(a: PlanId, b: PlanId): PlanId {
-  return PLAN_RANK[a] >= PLAN_RANK[b] ? a : b
+function isGoodStanding(status: SubscriptionStatus): boolean {
+  return status === 'active' || status === 'trialing' || status === 'past_due'
 }
 
 const VALID_STATUSES: SubscriptionStatus[] = [
@@ -192,15 +193,36 @@ async function lapsedOrgIds(supabase: SupabaseClient, orgIds: string[]): Promise
     if (owners.length === 0) return lapsed
     const subs = await supabase
       .from('subscriptions')
-      .select('user_id, plan_id, status')
+      .select('user_id, plan_id, status, stripe_customer_id, stripe_subscription_id')
       .in('user_id', owners)
     if (subs.error || !Array.isArray(subs.data)) return lapsed
     const byOwner = new Map(
-      (subs.data as { user_id: string; plan_id: string; status: string }[]).map((r) => [r.user_id, r])
+      (
+        subs.data as {
+          user_id: string
+          plan_id: string
+          status: string
+          stripe_customer_id?: string | null
+          stripe_subscription_id?: string | null
+        }[]
+      ).map((r) => [r.user_id, r])
     )
     for (const org of rows) {
       const sub = org.owner_id ? byOwner.get(org.owner_id) : undefined
-      if (!sub || sub.plan_id !== org.plan_id) continue
+      if (!sub) continue
+      if (sub.plan_id !== org.plan_id) {
+        // The owner's single subscription row now names a DIFFERENT plan.
+        // For a self-serve org (Team) that row is Stripe's: an owner who
+        // moved to Pro in the portal, or cancelled and bought Pro later, no
+        // longer pays for this org, so it lapses. A row with no Stripe link
+        // is hand-provisioned, and University (sold by invoice, contact
+        // sales) is never governed by the owner's personal Stripe plan.
+        const stripeLinked = !!(sub.stripe_customer_id || sub.stripe_subscription_id)
+        if (stripeLinked && PLAN_BY_ID[toPlanId(org.plan_id)]?.contactSales !== true) {
+          lapsed.add(org.id)
+        }
+        continue
+      }
       const good = sub.status === 'active' || sub.status === 'trialing' || sub.status === 'past_due'
       if (!good) lapsed.add(org.id)
     }
@@ -208,6 +230,41 @@ async function lapsedOrgIds(supabase: SupabaseClient, orgIds: string[]): Promise
     // Status quo on failure.
   }
   return lapsed
+}
+
+/** True for "the hardware_usage.credential_owner column does not exist". */
+function missingCredentialOwner(error: { code?: string; message?: string } | null | undefined): boolean {
+  if (!error) return false
+  const message = (error.message ?? '').toLowerCase()
+  return (
+    (error.code === 'PGRST204' || error.code === '42703') && message.includes('credential_owner')
+  )
+}
+
+/**
+ * Operator-funded hardware jobs in the usage window: the SAME population
+ * `reserve_hardware_job` counts. A job run on the user's own vendor credential
+ * (credential_owner = 'user') is exempt there, so it must not inflate the
+ * meter either. A project that has not applied supabase/schema-byok.sql has no
+ * such column; that is retried unfiltered (every row was operator-funded then).
+ * Returns null when the count cannot be read.
+ */
+async function operatorJobsUsed(
+  supabase: SupabaseClient,
+  userId: string,
+  periodStart: string
+): Promise<number | null> {
+  const base = () =>
+    supabase
+      .from('hardware_usage')
+      .select('id', { count: 'exact', head: true })
+      .eq('user_id', userId)
+      .gte('created_at', periodStart)
+  const filtered = await base().eq('credential_owner', 'operator')
+  if (!filtered.error && typeof filtered.count === 'number') return filtered.count
+  if (!missingCredentialOwner(filtered.error)) return null
+  const plain = await base()
+  return !plain.error && typeof plain.count === 'number' ? plain.count : null
 }
 
 export async function getEntitlement(userId: string | null): Promise<Entitlement> {
@@ -256,17 +313,18 @@ export async function getEntitlement(userId: string | null): Promise<Entitlement
             .map((r) => r.org_id)
             .filter((id): id is string => typeof id === 'string')
         )
+        // A personal subscription that is not in good standing (canceled,
+        // incomplete, none) grants nothing, so it must not outrank a seat of
+        // the same plan: stale {team, canceled} + a paid Team seat is Team.
+        const personalGood = isGoodStanding(status)
+        let effective: PlanId = personalGood ? planId : 'free'
         for (const raw of orgResult.data as Partial<OrgMemberRow>[]) {
           if (raw.org_id && lapsed.has(raw.org_id)) continue
           const seatPlan = toPlanId(raw.plan_id)
           const seatStatus = raw.status ? toStatus(raw.status) : 'active'
-          const seatGood =
-            seatStatus === 'active' ||
-            seatStatus === 'trialing' ||
-            seatStatus === 'past_due'
-          if (!seatGood) continue
-          const winner = stronger(planId, seatPlan)
-          if (winner === seatPlan && seatPlan !== planId) {
+          if (!isGoodStanding(seatStatus)) continue
+          if (PLAN_RANK[seatPlan] > PLAN_RANK[effective]) {
+            effective = seatPlan
             planId = seatPlan
             status = seatStatus
             currentPeriodEnd = undefined
@@ -287,15 +345,8 @@ export async function getEntitlement(userId: string | null): Promise<Entitlement
     // but it refuses me", and the customer is right.
     let hardwareJobsUsed = 0
     const periodStart = usagePeriodStart(currentPeriodEnd)
-    const usageResult = await supabase
-      .from('hardware_usage')
-      .select('id', { count: 'exact', head: true })
-      .eq('user_id', userId)
-      .gte('created_at', periodStart)
-
-    if (!usageResult.error && typeof usageResult.count === 'number') {
-      hardwareJobsUsed = usageResult.count
-    }
+    const used = await operatorJobsUsed(supabase, userId, periodStart)
+    if (used !== null) hardwareJobsUsed = used
 
     const entitlement: Entitlement = { planId, status, hardwareJobsUsed }
     if (currentPeriodEnd) entitlement.currentPeriodEnd = currentPeriodEnd

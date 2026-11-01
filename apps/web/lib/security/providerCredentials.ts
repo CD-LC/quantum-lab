@@ -305,6 +305,63 @@ const MAX_FIELD_CHARS = 4096
 /** Shortest a SECRET may be before it is obviously a typo or an empty paste. */
 const MIN_SECRET_CHARS = 8
 
+const GUID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+
+/**
+ * The SHAPE every non-secret ("public") field must have.
+ *
+ * Public fields are not just displayed back: services/api feeds `location` and
+ * `resource_id` into the Azure SDK, which builds an endpoint URL from them, and
+ * hands `region`, `s3_bucket` and the IBM instance to the vendor SDKs. A free
+ * account can store any of them (BYOK skips the plan check), so a value like
+ * `host.example/x?` in `location` would turn the API service into a request
+ * relay to a host of the caller's choosing. Every one is therefore pinned to
+ * the vendor's documented format here, and again in
+ * `services/api/app/quantum/credentials.py`, which does not trust this layer.
+ *
+ * Keyed `provider.field`. A public field with no entry is accepted as before
+ * (length and whitespace only); adding a provider field means adding its shape.
+ */
+const PUBLIC_FIELD_SHAPES: Record<string, { pattern: RegExp; expect: string }> = {
+  'ibm.instance': {
+    pattern: /^[A-Za-z0-9:._/-]{1,512}$/,
+    expect: 'a CRN such as crn:v1:bluemix:public:quantum-computing:…',
+  },
+  'braket.access_key_id': {
+    pattern: /^[A-Z0-9]{16,128}$/,
+    expect: 'upper-case letters and digits only, such as AKIA…',
+  },
+  'braket.region': {
+    pattern: /^[a-z]{2}(-[a-z]+)+-\d$/,
+    expect: 'an AWS region such as us-east-1',
+  },
+  'braket.s3_bucket': {
+    pattern: /^(?!.*\.\.)[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/,
+    expect: 'an S3 bucket name: 3–63 lower-case letters, digits, dots or hyphens',
+  },
+  'braket.s3_prefix': {
+    pattern: /^(?!.*\.\.)[A-Za-z0-9._/-]{1,256}$/,
+    expect: 'letters, digits, dots, hyphens, underscores or slashes',
+  },
+  'azure.resource_id': {
+    pattern: new RegExp(
+      `^/subscriptions/${GUID}/resourceGroups/[A-Za-z0-9._()-]{1,90}/providers/Microsoft\\.Quantum/Workspaces/[A-Za-z0-9_-]{1,64}$`,
+      'i'
+    ),
+    expect:
+      'the full id, /subscriptions/<guid>/resourceGroups/<name>/providers/Microsoft.Quantum/Workspaces/<name>',
+  },
+  'azure.location': {
+    pattern: /^[a-z0-9]{3,32}$/,
+    expect: 'an Azure region name such as eastus',
+  },
+  'azure.tenant_id': { pattern: new RegExp(`^${GUID}$`, 'i'), expect: 'a GUID' },
+  'azure.client_id': { pattern: new RegExp(`^${GUID}$`, 'i'), expect: 'a GUID' },
+}
+
+/** Fields Azure and AWS treat case-insensitively, folded before the shape check. */
+const LOWERCASED_FIELDS = new Set(['azure.location', 'braket.region'])
+
 /** True when this deployment can store BYOK credentials at all. */
 export function byokConfigured(): boolean {
   return isServiceRoleConfigured && secretBoxAvailable()
@@ -408,8 +465,19 @@ export function splitCredentialFields(
       return { ok: false, error: `${field.label} is too short to be valid.` }
     }
 
-    if (field.secret) secrets[field.name] = text
-    else publicConfig[field.name] = text
+    let stored = text
+    if (!field.secret) {
+      const key = `${provider}.${field.name}`
+      if (LOWERCASED_FIELDS.has(key)) stored = stored.toLowerCase()
+      const shape = PUBLIC_FIELD_SHAPES[key]
+      if (shape && !shape.pattern.test(stored)) {
+        // Name the field and the expected shape, never echo the value back.
+        return { ok: false, error: `${field.label} is not in the expected format — it should be ${shape.expect}.` }
+      }
+    }
+
+    if (field.secret) secrets[field.name] = stored
+    else publicConfig[field.name] = stored
   }
 
   if (!secrets[HINT_FIELD[provider]]) {

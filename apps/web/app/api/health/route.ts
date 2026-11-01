@@ -14,13 +14,18 @@
  * WHAT THIS DOES NOT PUBLISH, because it is unauthenticated and reachable by
  * anyone who can reach the app: no environment-variable values, no internal
  * hostnames or ports, no upstream response bodies, no exception messages, no
- * database or provider error text. Probe detail strings are written by hand in
- * lib/observability/health.ts and reviewed as public copy. What it does publish
- * is which optional integrations exist — that is inherent to a useful health
- * check and is already visible from the app's own behaviour.
+ * database or provider error text.
  *
- * `?verbose=0` trims the per-check detail to just statuses, for a monitor that
- * only wants the roll-up.
+ * ANONYMOUS CALLERS GET STATUSES ONLY, on every branch (success, 503 and the
+ * internal-error path): `version` and `environment` are empty strings and each
+ * check's `detail` is empty. The detail strings name the LLM vendor per tier,
+ * the mail provider and sender, and the admin count; the release and
+ * environment name are reconnaissance too. A caller holding HEALTH_DEEP_TOKEN
+ * (`x-health-token:` header or `token=`) gets all of it. With no token
+ * configured nobody is "trusted", so the detail is simply never published.
+ *
+ * `?verbose=0` trims a trusted caller's per-check detail to just statuses, for
+ * a monitor that only wants the roll-up.
  *
  * ── Cheap by default; the expensive checks are opt-in ───────────────────────
  *
@@ -100,10 +105,20 @@ function wantsDeep(req: Request, url: URL): boolean {
   return tokenMatches(supplied, expected)
 }
 
+function isTrusted(req: Request, url: URL): boolean {
+  const expected = (process.env.HEALTH_DEEP_TOKEN ?? '').trim()
+  if (!expected) return false
+  const supplied = (req.headers.get('x-health-token') ?? url.searchParams.get('token') ?? '').trim()
+  return tokenMatches(supplied, expected)
+}
+
 export async function GET(req: Request): Promise<Response> {
   const url = new URL(req.url)
-  const verbose = url.searchParams.get('verbose') !== '0'
   const deep = wantsDeep(req, url)
+  // Detail text, release and environment go only to a caller holding the
+  // configured token. Anonymous callers (crawlers, scanners) get statuses only.
+  const trusted = isTrusted(req, url)
+  const verbose = trusted && url.searchParams.get('verbose') !== '0'
 
   // Two buckets, two prefixes: exhausting the deep allowance must not stop the
   // orchestrator's cheap liveness probe from answering.
@@ -124,8 +139,8 @@ export async function GET(req: Request): Promise<Response> {
 
     const report: HealthReport = {
       status,
-      version: RELEASE,
-      environment: ENVIRONMENT,
+      version: trusted ? RELEASE : '',
+      environment: trusted ? ENVIRONMENT : '',
       at: new Date().toISOString(),
       // `deep` is echoed so a monitor cannot mistake a shallow `ok` (which
       // proves only that the process is wired) for a real dependency check.
@@ -152,8 +167,8 @@ export async function GET(req: Request): Promise<Response> {
     return NextResponse.json(
       {
         status: 'failing',
-        version: RELEASE,
-        environment: ENVIRONMENT,
+        version: trusted ? RELEASE : '',
+        environment: trusted ? ENVIRONMENT : '',
         at: new Date().toISOString(),
         deep,
         checks: {},

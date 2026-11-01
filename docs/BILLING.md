@@ -72,6 +72,12 @@ subscriber to `free`.
 **Settings → Billing → Customer portal → Activate**, allowing plan changes and
 cancellation.
 
+Checkout is for a *first* subscription only. `/api/billing/checkout` reuses the
+account's stored Stripe customer and answers 409 when the account already holds
+a live (`active`, `trialing`, `past_due`) subscription; the pricing page then
+sends the subscriber to the portal, which switches the one subscription and
+prorates the difference, instead of billing a second one.
+
 ---
 
 ## 3. Plans
@@ -168,7 +174,7 @@ Handled events:
 
 | Event | Effect on `public.subscriptions` |
 | --- | --- |
-| `checkout.session.completed` | Upserts the row: customer, subscription, plan, status, period end. |
+| `checkout.session.completed` | Upserts the row: customer, subscription, plan, status, period end. Applied only for a `mode: 'subscription'` session whose `client_reference_id` equals `metadata.userId`, is a UUID, and whose plan resolves to a known paid plan (`pro` / `team`); any other session (a Payment Link, a one-off charge) is acknowledged and ignored. |
 | `customer.subscription.created` | Same, from the subscription object. |
 | `customer.subscription.updated` | Plan/status/period-end refresh (upgrades, downgrades, cancel-at-period-end). |
 | `customer.subscription.deleted` | `status = 'canceled'`. |
@@ -176,7 +182,11 @@ Handled events:
 
 Anything else is logged and acknowledged with 200 — Stripe retries non-2xx
 responses, so an unhandled type must never 500. A *database* failure **does**
-return 500, on purpose: that is the one case where a retry helps.
+return 500, on purpose, and so does a failed call back *into* Stripe (an outage,
+a 429 or a timeout while `checkout.session.completed` or `invoice.payment_failed`
+re-reads the subscription): those are the cases where a retry helps. A Stripe
+answer that a retry cannot change (no such subscription, a bad key) is
+acknowledged with 200.
 
 ### Retries and ordering
 
@@ -199,6 +209,17 @@ things follow, and neither was handled before 2026-08-17:
   stamp is older than the last one applied to that account
   (`subscriptions.last_event_at`).
 
+**Endpoint API version.** The shape of `event.data.object` follows the API
+version the Dashboard *endpoint* was created with, not the SDK's. Create the
+production endpoint with **`2024-10-28.acacia`** (`STRIPE_API_VERSION` in
+`lib/billing/stripe.ts`, the version the SDK is pinned to). Newer versions drop
+the top-level `current_period_end` on subscriptions and `subscription` on
+invoices; as a safety net the handler re-reads the subscription through the
+pinned client whenever `event.api_version` differs and logs one warning, and it
+also looks for the invoice's subscription under `parent.subscription_details`.
+That keeps renewals and `past_due` correct, at the cost of one extra Stripe call
+per event, so fix the endpoint rather than relying on it.
+
 What was **already** right and must stay that way: the signature is verified
 against the raw body before anything else runs, and the user id comes from the
 event (`metadata.userId` / `client_reference_id`) rather than from the request.
@@ -209,6 +230,11 @@ You can replay an event without paying again:
 stripe trigger checkout.session.completed
 stripe trigger customer.subscription.deleted
 ```
+
+(`stripe trigger checkout.session.completed` uses Stripe's fixture session, which
+carries none of this app's `client_reference_id` / `metadata.userId`, so it is
+acknowledged and ignored; to exercise the checkout path, buy through
+`/pricing` in test mode.)
 
 ### Production endpoint
 
@@ -367,6 +393,14 @@ The rules that keep the two layers honest:
 - **Grace for dunning.** `past_due` keeps access (see `effectivePlan`), so a
   failed renewal does not lock someone out mid-sentence. `canceled` and
   `incomplete` fall back to Free.
+- **`unpaid` is not grace.** In Stripe, `unpaid` means dunning has finished and
+  the subscription will not be retried or charged again. `toStatus` maps it to
+  `canceled`, so the account falls back to Free, and reconciliation ranks it
+  below `canceled`. Set the dunning behaviour under **Settings → Billing →
+  Subscriptions and emails → Manage failed payments**. Either "cancel the
+  subscription" or "mark the subscription as unpaid" now ends access; "leave
+  the subscription past-due" keeps Stripe's `past_due` status forever, which
+  this code treats as grace with no time limit, so do not choose it.
 
 ### Where entitlements come from
 
@@ -444,9 +478,12 @@ be stale relative to any event.
 | An operator or cron | `x-reconcile-secret: $BILLING_RECONCILE_SECRET` | Any user id. |
 
 With `BILLING_RECONCILE_SECRET` unset the header is ignored entirely — an empty
-secret must never authorise anything. Rate limited to 5/min per IP because every
-allowed call reaches Stripe, and Stripe rate-limits the *account*, not the
-caller.
+secret must never authorise anything. A call without the secret is rate limited
+to 5/min per IP because every allowed call reaches Stripe, and Stripe
+rate-limits the *account*, not the caller. A call that presents the operator
+secret is limited per *target account* (20/min) instead: the sweep below is many
+accounts from one host, and a per-IP limit silently refused the sixth account
+onwards with a 429 that `curl -sS` reports as success.
 
 ### When it should run
 
@@ -455,8 +492,17 @@ caller.
    24 hours in the past — a renewal that happened at Stripe and never reached
    us, i.e. exactly the case where a paying customer is being refused. It
    self-heals on their next page load, with a 10-minute per-process cooldown.
-2. **On demand**, from support or from an account page button, when a customer
-   says "I upgraded and it still says Free".
+   Only a row whose stored status still grants access (`active`, `trialing`,
+   `past_due`) qualifies: a `canceled` / `none` row keeps its past period end
+   forever, and re-querying Stripe for every ex-subscriber would burn the
+   account-wide rate limit for nothing.
+2. **On demand**, from support, and **automatically after checkout**: the
+   account page, when it opens with `?checkout=success`, calls
+   `POST /api/billing/reconcile` and re-reads the entitlement up to five times
+   over about 45 seconds while the plan is still Free
+   (`lib/billing/confirmCheckout.ts`). First-time checkout now creates the Stripe
+   customer *before* the session and records it, so the reconciler can find a
+   buyer whose first webhook never landed.
 3. **Nightly**, for every account holding a `stripe_customer_id`. Not wired:
    this repository has no scheduler, and inventing one that never runs is the
    kind of decoration this project has been burned by before. The loop:
@@ -466,7 +512,7 @@ caller.
    psql "$SUPABASE_DB_URL" -Atc \
      "select user_id from public.subscriptions where stripe_customer_id is not null" |
    while read -r uid; do
-     curl -sS -X POST "$APP_URL/api/billing/reconcile" \
+     curl -sS --fail -X POST "$APP_URL/api/billing/reconcile" \
        -H "content-type: application/json" \
        -H "x-reconcile-secret: $BILLING_RECONCILE_SECRET" \
        -d "{\"userId\":\"$uid\"}"
@@ -606,11 +652,21 @@ website; the apps reflect whatever plan the account has.
 * Detection: `apps/web/lib/app-shell.ts` (`STORE_APP_SCRIPT`, run before first
   paint by `components/ui/StoreAppScript.tsx`) marks `<html data-store-app>` when
   the user agent carries `Qubit16App` (iOS), the referrer is
-  `android-app://ai.qubit16.app` or the URL has `?app=android` (Android TWA). It
-  is remembered in `sessionStorage` for that app session only.
+  `android-app://ai.qubit16.app`, or the URL has `?app=android` **and** the user
+  agent is Android **and** the page is in an installed-app display mode
+  (`standalone` or `fullscreen`, which a TWA matches and an ordinary browser tab
+  does not). `?app=ios` is **not** honoured at all — the iOS app is identified by
+  its user-agent token — and `?app=android` in a normal browser tab does nothing,
+  so a shared `/pricing?app=android` link cannot hide the purchase path for other
+  visitors. It is remembered in `sessionStorage` for that app session only.
 * Hiding: one CSS rule in `app/globals.css`, so a new `/pricing` link anywhere is
   covered automatically. Use `data-store-hide` for a whole phrase or block, and
   `data-store-only` for in-app-only replacement text.
-* Backstop: `/api/billing/checkout` answers 403 to the iOS app's user agent. The
-  Android app is real Chrome and cannot be told apart server-side.
+* Backstop: `/api/billing/checkout` and `/api/billing/portal` answer 403 to the
+  iOS app's user agent (the portal allows plan changes, so it is a purchase path
+  too). The Android app is real Chrome and cannot be told apart server-side.
+* The account page's "Manage billing" button (and the status line it renders)
+  carries `data-store-hide`, and is rendered only when the entitlement route
+  reports `billingEnabled` — so it is absent in the store apps and on a
+  deployment with Stripe off. Guarded by `lib/billing/accountPage.test.ts`.
 * Tests: `apps/web/lib/app-shell.store.test.ts`.

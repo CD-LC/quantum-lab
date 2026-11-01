@@ -166,6 +166,35 @@ function PlanCard({
 }) {
   const [state, setState] = useState<CtaState>({ kind: 'idle' })
 
+  /**
+   * Hand a subscriber to Stripe's customer portal to change plan.
+   *
+   * Checkout makes a NEW subscription, so for an account that already has one
+   * the route answers 409 and this is where that lands: the portal switches the
+   * one subscription (prorated) instead of billing a second one. See
+   * docs/BILLING.md §2.
+   */
+  const openPortal = useCallback(async () => {
+    try {
+      const response = await authFetch('/api/billing/portal', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ userId }),
+      })
+      const parsed = readCheckoutResponse(await response.json().catch(() => null))
+      if (parsed.url) {
+        window.location.assign(parsed.url)
+        return
+      }
+      setState({
+        kind: parsed.error ? 'error' : 'notice',
+        message: parsed.error ?? parsed.message ?? NOT_CONFIGURED_FALLBACK,
+      })
+    } catch {
+      setState({ kind: 'notice', message: NOT_CONFIGURED_FALLBACK })
+    }
+  }, [userId])
+
   const startCheckout = useCallback(async () => {
     // Before the fetch on purpose: intent is the number worth having, so an
     // abandoned, failed or unconfigured checkout still counts.
@@ -185,6 +214,11 @@ function PlanCard({
         setState({ kind: 'notice', message: parsed.message ?? NOT_CONFIGURED_FALLBACK })
         return
       }
+      if (response.status === 409) {
+        // Already subscribed: change the plan on the existing subscription.
+        await openPortal()
+        return
+      }
       if (parsed.error) {
         setState({ kind: 'error', message: parsed.error })
         return
@@ -201,7 +235,7 @@ function PlanCard({
     } catch {
       setState({ kind: 'notice', message: NOT_CONFIGURED_FALLBACK })
     }
-  }, [plan.id, period, userId, email])
+  }, [plan.id, period, userId, email, openPortal])
 
   const isCurrent = currentPlanId === plan.id
   const saving = yearlySavingPercent(plan)
@@ -286,6 +320,7 @@ function PlanCard({
           onCheckout={() => void startCheckout()}
           launchTrialDays={launchTrialDays}
           signedIn={Boolean(userId)}
+          changing={Boolean(currentPlanId) && currentPlanId !== 'free'}
         />
       </div>
 
@@ -323,6 +358,7 @@ function PlanCta({
   onCheckout,
   launchTrialDays = 0,
   signedIn = false,
+  changing = false,
 }: {
   plan: Plan
   isCurrent: boolean
@@ -330,6 +366,8 @@ function PlanCta({
   onCheckout: () => void
   launchTrialDays?: number
   signedIn?: boolean
+  /** The viewer is already on a paid plan: this is a switch, not a purchase. */
+  changing?: boolean
 }) {
   if (isCurrent) {
     return (
@@ -386,7 +424,7 @@ function PlanCta({
 
   return (
     <Button type="button" className="w-full" disabled={pending} onClick={onCheckout}>
-      {pending ? 'Redirecting…' : `Upgrade to ${plan.name}`}
+      {pending ? 'Redirecting…' : changing ? `Change to ${plan.name}` : `Upgrade to ${plan.name}`}
     </Button>
   )
 }

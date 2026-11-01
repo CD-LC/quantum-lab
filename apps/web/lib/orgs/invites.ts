@@ -196,3 +196,28 @@ export function buildInviteRecord(
     createdAt: now.toISOString(),
   }
 }
+
+/**
+ * The organisation name as it may appear in an invitation's subject and body.
+ *
+ * An org's name is free text chosen by whoever created it, and the invite mail
+ * goes out from the product's verified sender to an address the inviter picks.
+ * Left raw, the name is a channel for the sender's own message (a URL, a phone
+ * number, an instruction) delivered with Qubit16's reputation behind it. So:
+ * URLs, bare domains, email addresses and long digit runs are removed, control
+ * characters and runs of whitespace are collapsed, and the result is capped.
+ * Nothing legitimate loses anything: "Acme Physics Dept" is unchanged.
+ */
+export function mailSafeOrgName(name: string): string {
+  const cleaned = name
+    .replace(/[\u0000-\u001f\u007f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/g, ' ')
+    .replace(/\b(?:https?:\/\/|www\.)\S+/gi, ' ')
+    .replace(/\S+@\S+/g, ' ')
+    .replace(/\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:com|net|org|io|ai|co|me|ly|xyz|info|biz|app|dev|link|click|top|site|online|shop)\b\S*/gi, ' ')
+    .replace(/\+?\d[\d\s().-]{6,}\d/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 60)
+    .trim()
+  return cleaned || 'an organisation'
+}

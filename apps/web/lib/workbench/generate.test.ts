@@ -140,7 +140,9 @@ describe('generateVerifiedCircuit', () => {
     const result = await generateVerifiedCircuit(bellSpec, provider)
     expect(result.ok).toBe(false)
     expect(result.stopped).toBe('provider_error')
-    expect(result.error).toBe('HTTP 503')
+    // The provider's own text (here 'HTTP 503') never reaches the caller.
+    expect(result.error).toBe('The model provider returned an error; try again later.')
+    expect(result.attempts[0].parseError).not.toContain('503')
     expect(result.attempts).toHaveLength(1)
   })
 

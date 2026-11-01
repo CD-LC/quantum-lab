@@ -216,8 +216,11 @@ will still run jobs on your own credential, but it will ALSO count them against
 your monthly allowance, and the whole point of step 6 disappears.
 
 Also confirm `SETTINGS_ENCRYPTION_KEY` is set on the web app. Without it the
-panel answers 503 and refuses to store anything, which is the correct refusal —
-it will not write a vendor credential it cannot encrypt.
+panel still stores credentials, but under a key derived from the Supabase
+service-role key (see "Moving off the fallback key" in section 9). The panel
+answers 503 only when NEITHER `SETTINGS_ENCRYPTION_KEY` nor
+`SUPABASE_SERVICE_ROLE_KEY` is set, because then there is nothing to encrypt
+with.
 
 ### Step 1 — get an IBM token (free, ~2 minutes)
 
@@ -372,8 +375,48 @@ supabase db push        # or paste supabase/schema-byok.sql into the SQL editor
 ```
 
 Without `SETTINGS_ENCRYPTION_KEY`, `secretBox` derives a key from the
-service-role key, so BYOK technically works — but rotating the service-role key
-then silently invalidates every stored credential. Set it explicitly.
+service-role key, so BYOK technically works — but anyone who can read the
+service-role key can decrypt every stored credential, and rotating the
+service-role key then silently invalidates all of them. Set it explicitly.
+BYOK deliberately does NOT refuse to start without it: that would lock out the
+users whose credentials are already stored under the derived key.
+
+### Moving off the fallback key
+
+*How to tell you are on it.* Any one of:
+
+- the web app's log has, once per process, `[secretBox] SETTINGS_ENCRYPTION_KEY
+  is not set: stored BYOK credentials … are sealed under a key DERIVED FROM
+  SUPABASE_SERVICE_ROLE_KEY …` (also sent to the error tracker as a warning
+  when one is configured);
+- `/api/health` called with `HEALTH_DEEP_TOKEN` reports `byokKeyIsFallback:
+  true` (trusted callers only; anonymous callers never see it);
+- `SETTINGS_ENCRYPTION_KEY` is absent from the Container App's environment.
+
+*The migration, which locks nobody out:*
+
+1. Generate a key and store it somewhere other than the Supabase project:
+   `openssl rand -hex 32`. Losing it makes every credential sealed under it
+   unreadable, so keep a copy in your secret manager.
+2. Set it on the web app as `SETTINGS_ENCRYPTION_KEY` and redeploy (for
+   `infra/azure/deploy.sh`, add it to the secrets it already passes).
+3. Nothing breaks. From that moment every NEW or re-saved credential is sealed
+   under the explicit key only. A credential sealed earlier still opens,
+   because `open()` falls back to the derived key for values the explicit key
+   cannot open.
+4. Those earlier credentials are still protected only by the derived key until
+   their owner saves them again (or removes them). Ask users with a stored
+   credential to re-enter it, or — if you accept the disruption — delete the
+   rows so they must: `delete from user_provider_credentials;` (their running
+   jobs are unaffected; the panel shows them as not attached). There is no
+   automatic re-seal.
+5. Confirm: the warning in step "How to tell" no longer appears after a
+   restart and `byokKeyIsFallback` reads `false`. Once every row has been
+   re-saved you may rotate the service-role key without affecting BYOK.
+
+*Do not* simply set a different value later to "rotate": a value sealed under
+the old explicit key becomes unreadable (the panel flags the row, and the user
+must re-enter it). See "If the platform rotates its encryption key" above.
 
 Without the migration, BYOK still works and jobs still run on the user's own
 credential; they are simply also counted against that user's monthly allowance,

@@ -878,7 +878,7 @@ test('the hardware cost estimate is announced when it settles', async ({ page })
   await goto(page, '/hardware')
 
   // The price is on screen…
-  await expect(page.getByText('Estimated cost')).toBeVisible()
+  await expect(page.getByText('Estimated cost', { exact: true })).toBeVisible()
 
   // …and it was also said out loud, with the currency and the shot count, so
   // the figure is not ambiguous.
@@ -1106,7 +1106,7 @@ test('a checkout outcome is announced, not just rendered', async ({ page }) => {
   await upgrade.click()
 
   const outcome = page.locator('[role="status"], [role="alert"]').filter({
-    hasText: /billing|checkout/i,
+    hasText: /billing|checkout|paid plans|available for purchase/i,
   })
   await expect(
     outcome.first(),

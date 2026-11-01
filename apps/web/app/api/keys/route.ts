@@ -25,7 +25,7 @@
 import { NextResponse } from 'next/server'
 import { rateLimit, callerKey, retryAfterHeaders } from '@/lib/rateLimit'
 import { signInRequiredResponse, verifiedCallerId } from '@/lib/security/auth'
-import { isRecord, safeJson, str } from '@/lib/security/validate'
+import { isRecord, readJsonBody, str } from '@/lib/security/validate'
 import {
   API_SCOPES,
   ApiKeyStoreError,
@@ -105,7 +105,8 @@ export async function POST(req: Request): Promise<Response> {
 
   // 4 KiB is generous for `{name, scopes}` and small enough that a bad client
   // cannot make the server buffer anything interesting.
-  const parsed = safeJson(await req.text(), 4096)
+  const parsed = await readJsonBody(req, 4096)
+  if (!parsed.ok && parsed.tooLarge) return NextResponse.json({ error: parsed.error }, { status: 413 })
   if (!parsed.ok) return NextResponse.json({ error: parsed.error }, { status: 400 })
   if (!isRecord(parsed.value)) {
     return NextResponse.json({ error: 'Expected a JSON object body.' }, { status: 400 })

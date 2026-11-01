@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server'
 import { APICallError, generateText } from 'ai'
 import { apiError, badRequest } from '@/lib/apiError'
 import { callerKey, rateLimit, retryAfterHeaders } from '@/lib/rateLimit'
-import { arr, isRecord, safeJson, str } from '@/lib/security/validate'
+import { arr, isRecord, readJsonBody, str } from '@/lib/security/validate'
 import { verifiedCaller } from '@/lib/security/auth'
 import { getEntitlement } from '@/lib/billing/entitlements'
 import { effectiveLlmSettings } from '@/lib/platform/settings'
@@ -16,7 +16,9 @@ import {
   type ProviderId,
 } from '@/lib/platform/llmConfig'
 import { resolveForTier, tierOf } from '@/lib/llm/resolve'
-import { buildLanguageModel } from '@/lib/llm/model'
+import { liveModelForCaller } from '@/lib/llm/callerAccess'
+import { reportError } from '@/lib/observability/report'
+import { buildLanguageModel, llmTimeoutSignal } from '@/lib/llm/model'
 import {
   EVOLVE_LIMITS,
   GRAMMAR,
@@ -57,12 +59,49 @@ const MAX_BODY_BYTES = 64_000
 const MAX_REPLY_TOKENS = 700
 const MAX_ELITES = EVOLVE_LIMITS.eliteMax
 
+/**
+ * Daily-quota namespace, shared with /api/workbench/generate ON PURPOSE: both
+ * routes spend the same per-tier `messagesPerDay` model budget, so a caller
+ * cannot double it by alternating between them.
+ */
+export const EVOLVE_QUOTA_PREFIX = 'workbench-day'
+
+/**
+ * The address the daily quota is keyed on: the same precedence `callerKey`
+ * uses (edge-written cf-connecting-ip, else the first x-forwarded-for hop,
+ * else x-real-ip), so the quota bucket is the bucket this route's rate limit
+ * already keys on.
+ */
+function clientAddress(headers: Headers): string | null {
+  const cf = headers.get('cf-connecting-ip')?.trim() ?? ''
+  const firstHop = (headers.get('x-forwarded-for') ?? '').split(',')[0]?.trim() ?? ''
+  const real = headers.get('x-real-ip')?.trim() ?? ''
+  return (cf || firstHop || real).slice(0, 64) || null
+}
+
 const SYSTEM =
   'You propose candidate programs for a small optimisation search. Reply with the requested number of ' +
   'programs, each in its own fenced code block, and no prose. A program that uses any line outside the ' +
   'grammar you are shown is discarded.'
 
-function readyProviders(settings: LlmSettings): { id: ProviderId; label: string }[] {
+/**
+ * The providers a caller of this tier may ask. When the admin pinned a
+ * provider (`forceProvider`, or this tier's own pin) and it is ready, the
+ * caller gets exactly that one: letting a free or anonymous visitor name a
+ * dearer provider would walk around the cost policy resolveForTier applies.
+ * Unpinned, every ready provider is open to choose (that is what lets the
+ * page run several side by side).
+ */
+function allowedProviders(
+  settings: LlmSettings,
+  resolved: ProviderId,
+  tier: ReturnType<typeof tierOf>,
+): { id: ProviderId; label: string }[] {
+  const ready = (id: ProviderId | 'auto' | null | undefined): boolean =>
+    Boolean(id) && id !== 'auto' && providerReady(id as ProviderId, settings.providers[id as ProviderId])
+  if (ready(settings.forceProvider) || ready(settings.tiers[tier].provider)) {
+    return [{ id: resolved, label: PROVIDER_LABEL[resolved] }]
+  }
   return settings.order
     .filter((id) => providerReady(id, settings.providers[id]))
     .map((id) => ({ id, label: PROVIDER_LABEL[id] }))
@@ -85,7 +124,11 @@ export async function GET(req: Request): Promise<Response> {
   if (resolution.kind !== 'live') {
     return NextResponse.json({ tier, providers: [], reason: resolution.kind === 'off' ? 'tier_off' : 'offline' })
   }
-  return NextResponse.json({ tier, providers: readyProviders(settings), reason: null })
+  return NextResponse.json({
+    tier,
+    providers: allowedProviders(settings, resolution.provider.id, tier),
+    reason: null,
+  })
 }
 
 export async function POST(req: Request): Promise<Response> {
@@ -96,7 +139,8 @@ export async function POST(req: Request): Promise<Response> {
     return apiError('rate_limited', { headers: retryAfterHeaders(minute.allowed ? hour : minute) })
   }
 
-  const parsed = safeJson(await req.text(), MAX_BODY_BYTES)
+  const parsed = await readJsonBody(req, MAX_BODY_BYTES)
+  if (!parsed.ok && parsed.tooLarge) return apiError('payload_too_large')
   if (!parsed.ok) return badRequest(parsed.error)
   const body = parsed.value
   if (!isRecord(body)) return badRequest('Expected a JSON object.')
@@ -129,19 +173,34 @@ export async function POST(req: Request): Promise<Response> {
   const requested = body.provider
   if (requested !== undefined && !isProviderId(requested)) return badRequest('Unknown provider id.')
 
-  const { tier, settings, resolution } = await resolveCaller(req)
-  if (resolution.kind !== 'live') {
+  // Who is asking, does their tier get a model, and — the part that costs
+  // money — have they any of today's allowance left? One unit is charged here,
+  // before a provider is built, exactly as /api/workbench/generate does.
+  const access = await liveModelForCaller(
+    { authorization: req.headers.get('authorization'), clientIp: clientAddress(req.headers) },
+    EVOLVE_QUOTA_PREFIX,
+  )
+  if (access.kind !== 'live') {
+    if (access.reason === 'quota_spent' || access.reason === 'quota_zero') {
+      const wait = access.reason === 'quota_spent' && access.resetAt ? Math.max(1, Math.ceil((access.resetAt - Date.now()) / 1000)) : 3600
+      return apiError('rate_limited', {
+        message: access.note,
+        headers: { 'retry-after': String(wait) },
+      })
+    }
     return apiError('forbidden', {
       message:
-        tier === 'anonymous'
+        access.tier === 'anonymous'
           ? 'Model proposals are available to signed-in users. The built-in mutation operator still runs without one.'
           : 'Your plan does not include live model calls; the built-in mutation operator still runs.',
     })
   }
-  let provider = resolution.provider
-  if (requested !== undefined) {
-    if (!providerReady(requested, settings.providers[requested])) {
-      return apiError('not_configured', { message: `${PROVIDER_LABEL[requested]} is not configured on this deployment.` })
+  const { tier } = access
+  const { settings } = await effectiveLlmSettings()
+  let provider = access.resolution.provider
+  if (requested !== undefined && requested !== provider.id) {
+    if (!allowedProviders(settings, provider.id, tier).some((p) => p.id === requested)) {
+      return apiError('not_configured', { message: `${PROVIDER_LABEL[requested]} is not available to your plan on this deployment.` })
     }
     // Same shape resolveForTier builds, for the provider the caller named.
     const cfg = settings.providers[requested]
@@ -171,10 +230,12 @@ export async function POST(req: Request): Promise<Response> {
       system: SYSTEM,
       prompt,
       maxOutputTokens: MAX_REPLY_TOKENS,
+      abortSignal: llmTimeoutSignal(),
     })
     const programs = extractPrograms(result.text).slice(0, EVOLVE_LIMITS.proposalsPerProvider)
     return NextResponse.json({ provider: provider.label, providerId: provider.id, programs })
   } catch (cause) {
+    reportError(cause, { route: 'api/workbench/evolve', stage: 'complete', provider: provider.id })
     if (APICallError.isInstance(cause)) {
       const status = cause.statusCode
       return apiError(status === 429 ? 'rate_limited' : 'upstream_error', {

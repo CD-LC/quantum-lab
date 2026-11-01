@@ -52,7 +52,7 @@
 import { NextResponse } from 'next/server'
 import { callerKey, rateLimit, retryAfterHeaders } from '@/lib/rateLimit'
 import { signInRequiredResponse, verifiedCallerId } from '@/lib/security/auth'
-import { isRecord, safeJson } from '@/lib/security/validate'
+import { isRecord, readJsonBody } from '@/lib/security/validate'
 import {
   BYOK_PROVIDERS,
   PROVIDER_FIELDS,
@@ -167,7 +167,8 @@ export async function POST(req: Request): Promise<Response> {
     )
   }
 
-  const parsed = safeJson(await req.text(), MAX_BODY_BYTES)
+  const parsed = await readJsonBody(req, MAX_BODY_BYTES)
+  if (!parsed.ok && parsed.tooLarge) return NextResponse.json({ error: parsed.error }, { status: 413 })
   if (!parsed.ok) return NextResponse.json({ error: parsed.error }, { status: 400 })
   if (!isRecord(parsed.value)) {
     return NextResponse.json({ error: 'Expected a JSON object body.' }, { status: 400 })

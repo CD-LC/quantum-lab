@@ -19,14 +19,14 @@
  */
 
 import { NextResponse } from 'next/server'
-import { badRequest } from '@/lib/apiError'
+import { badRequest, apiError } from '@/lib/apiError'
 import { getEntitlement } from '@/lib/billing/entitlements'
 import { resolveForTier, tierOf } from '@/lib/llm/resolve'
 import { reportError } from '@/lib/observability/report'
 import { effectiveLlmSettings } from '@/lib/platform/settings'
 import { callerKey, rateLimit, retryAfterHeaders } from '@/lib/rateLimit'
 import { verifiedCaller } from '@/lib/security/auth'
-import { isRecord, safeJson } from '@/lib/security/validate'
+import { isRecord, readJsonBody } from '@/lib/security/validate'
 import { generateVerifiedCircuit } from '@/lib/workbench/generate'
 import { adapterFor } from '@/lib/workbench/liveProvider'
 import { parseGenerateArgs, serializeAttempt, serializeGenerateResult } from '@/lib/workbench/mcpTool'
@@ -52,7 +52,8 @@ export async function POST(req: Request): Promise<Response> {
       )
     }
 
-    const parsed = safeJson(await req.text(), MAX_BODY_BYTES)
+    const parsed = await readJsonBody(req, MAX_BODY_BYTES)
+    if (!parsed.ok && parsed.tooLarge) return apiError('payload_too_large')
     if (!parsed.ok) return badRequest(parsed.error)
     if (!isRecord(parsed.value)) return badRequest('Request body must be a JSON object.')
     const body = parsed.value

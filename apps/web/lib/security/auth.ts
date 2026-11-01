@@ -46,6 +46,69 @@ export interface VerifiedCaller {
 }
 
 /**
+ * What happened when we tried to identify the caller. The three reasons for
+ * "no caller" that `verifiedCaller` flattens into one `null` are kept apart
+ * here, because they need three different answers:
+ *
+ *   - `none`        No token was presented (or this deployment has no auth
+ *                   service configured, so no token CAN be checked). The caller
+ *                   is anonymous. Fine for a route that admits guests.
+ *   - `invalid`     A token was presented and the auth service said it is not a
+ *                   session: expired, revoked, forged. Answer 401 so the client
+ *                   refreshes its session; do NOT quietly treat it as anonymous.
+ *   - `unavailable` A token was presented and the auth service could not say
+ *                   (network failure, timeout, 5xx, rate limit). The token may
+ *                   be perfectly good. Answer 503 so the client retries; do NOT
+ *                   treat the caller as anonymous.
+ *   - `ok`          Vouched for.
+ */
+export type CallerOutcome =
+  | { kind: 'ok'; caller: VerifiedCaller }
+  | { kind: 'none' }
+  | { kind: 'invalid' }
+  | { kind: 'unavailable' }
+
+/**
+ * Is this Supabase auth error "the service could not answer" rather than "the
+ * token is bad"? Network failures surface as `AuthRetryableFetchError`
+ * (status 0 or undefined), a struggling service as 5xx, a throttled one as 429.
+ * Everything else (400/401/403: bad JWT, session not found, expired) is the
+ * token's fault.
+ */
+function isServiceFailure(error: { name?: string; status?: number }): boolean {
+  if (error.name === 'AuthRetryableFetchError') return true
+  const status = error.status
+  if (typeof status !== 'number') return false
+  return status === 0 || status === 429 || status >= 500
+}
+
+/**
+ * Like `verifiedCaller`, but says WHY there is no caller.
+ *
+ * Use this on any route where "the token did not verify" must not be treated
+ * the same as "there was no token" (audit finding exams-certs #37: a signed-in
+ * candidate was silently dealt a guest attempt during a transient auth outage).
+ * `verifiedCaller` is unchanged and still collapses all three to `null`.
+ *
+ * Never throws.
+ */
+export async function verifyCallerOutcome(req: Request): Promise<CallerOutcome> {
+  const token = bearerToken(req)
+  if (!token) return { kind: 'none' }
+  const supabase = getSupabase()
+  if (!supabase) return { kind: 'none' }
+  try {
+    const { data, error } = await supabase.auth.getUser(token)
+    if (error) return isServiceFailure(error) ? { kind: 'unavailable' } : { kind: 'invalid' }
+    const id = data.user?.id
+    if (!id) return { kind: 'invalid' }
+    return { kind: 'ok', caller: { id, email: (data.user?.email ?? '').trim().toLowerCase() } }
+  } catch {
+    return { kind: 'unavailable' }
+  }
+}
+
+/**
  * Resolve the caller from their access token: id AND verified email.
  *
  * The email is here for the invite-acceptance path (audit finding INV-1), which
@@ -53,22 +116,13 @@ export interface VerifiedCaller {
  * That question is only meaningful against an email SUPABASE returns for the
  * token — an email in a request body is a claim, exactly like a `userId`.
  *
- * Returns null when no valid token is present. Never throws.
+ * Returns null when no valid token is present, INCLUDING when the auth service
+ * could not be reached; use `verifyCallerOutcome` to tell those apart. Never
+ * throws.
  */
 export async function verifiedCaller(req: Request): Promise<VerifiedCaller | null> {
-  const token = bearerToken(req)
-  if (!token) return null
-  const supabase = getSupabase()
-  if (!supabase) return null
-  try {
-    const { data, error } = await supabase.auth.getUser(token)
-    if (error) return null
-    const id = data.user?.id
-    if (!id) return null
-    return { id, email: (data.user?.email ?? '').trim().toLowerCase() }
-  } catch {
-    return null
-  }
+  const outcome = await verifyCallerOutcome(req)
+  return outcome.kind === 'ok' ? outcome.caller : null
 }
 
 /**

@@ -907,3 +907,148 @@ well as through Cloudflare. Two steps close the direct path:
    (strict)**, so the edge verifies the origin certificate.
 
 After both, `https://qubit16.ai` works and the raw app hostnames answer 403.
+
+> **Correction (2026-10-27).** The sentence above holds for the web app only.
+> `restrict-origin-to-cloudflare.sh` has not been applied to `quantum-lab-api`:
+> its raw `*.azurecontainerapps.io` hostname still answers (item 1 below).
+
+## Open operator items (as of 2026-10-27)
+
+These need an Azure, Cloudflare, Apple or Supabase login that the code review
+and the automated fixes did not have. None is closed by a commit. Nothing here
+has been tested by the people who wrote it down: Docker and `az` were not
+available when this list was written.
+
+1. **Restrict the `services/api` origin.** The api Container App has external
+   ingress and its raw hostname answers from the internet. Its `/api/health` is
+   exempt from the shared-secret gate and runs a probe circuit per call with no
+   rate limit. The hostname is also named in the site's CSP `connect-src`. Run
+   `bash infra/azure/restrict-origin-to-cloudflare.sh` for the api app too (or
+   make its ingress internal if the browser does not need to reach it), then
+   confirm the raw hostname answers 403.
+2. **Disable the ACR admin account.** `infra/azure/deploy.sh`,
+   `attach-domain.sh` and `deploy-email-cron.sh` create the registry with
+   `--admin-enabled true` and store its static password on every Container App
+   and the cron job. Move to a system-assigned managed identity with `AcrPull`
+   (`--registry-identity system`), then `az acr update --admin-enabled false`
+   and delete `refresh_registry_creds()` and the `az acr credential show` lines.
+3. **`www.qubit16.ai` returns Cloudflare 525.** No `www` hostname or certificate
+   is bound on the web app. Either add a Cloudflare redirect rule
+   `www.qubit16.ai/*` -> `https://qubit16.ai/$1` (301), or run
+   `DOMAIN=www.qubit16.ai bash infra/azure/attach-domain.sh`. Until then the
+   `applinks:www.qubit16.ai` entitlement in the iOS app cannot verify.
+4. **Apple Team ID placeholder.** `apps/web/public/.well-known/apple-app-site-association`
+   still contains `REPLACE_WITH_APPLE_TEAM_ID`, and `apps/ios/project.yml` has an
+   empty `DEVELOPMENT_TEAM`. Universal Links do not work until both carry the
+   real Team ID (docs/IOS.md step 2). It must come from the Apple Developer
+   account; it is not guessed here.
+5. **Apply Supabase migration `20261022000040_rls_audit_2026_10_22.sql`** to
+   production (`supabase db push`, or `supabase/apply-all-migrations.sql`), then
+   run `supabase/verify-migrations.sql` and expect no `REGRESSED` row.
+6. **Set `HEALTH_DEEP_TOKEN`** on the web app if you want release, environment
+   and per-check detail from `/api/health`. Without it nobody is trusted and
+   anonymous callers (and you) get statuses only.
+7. **GitHub Actions are pinned to tags, not commit SHAs.** `actions/checkout`,
+   `setup-node`, `setup-python`, `setup-java`, `cache`, `upload-artifact`,
+   `azure/login`, `gradle/actions/setup-gradle` and `cloudflare/wrangler-action`
+   should each be pinned to a full commit SHA with a `# vX.Y.Z` comment, and
+   `npx --yes wrangler@3` in `pages.yml` pinned to an exact version. The SHAs
+   were not available offline and were not invented; resolve them with
+   `gh api repos/<owner>/<repo>/git/ref/tags/<tag>` and add a Dependabot entry
+   for the `github-actions` ecosystem.
+8. **Stripe is not configured in production.** `/api/health` reports
+   `stripe: skipped`, so Upgrade on `/pricing` cannot complete. Set
+   `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` and the `STRIPE_PRICE_*` ids on
+   the web app.
+9. **Node 22 rollout.** The web image and CI moved to Node 22 in code; the
+   running site only changes when the next web image is built and deployed.
+   The root `package.json` `engines.node` (`>=18.17`) is outside the files
+   changed with this list and should be raised to `>=22`.
+
+## 2026-10-27 wave 3
+
+Fixes from the third pass over the audit findings. Each has a unit test beside
+the code. Nothing here was exercised against production.
+
+### Exam subject resolution no longer turns a bad session into a guest
+
+`lib/security/auth.ts` gains `verifyCallerOutcome`, which tells apart *no token*,
+*invalid or expired token*, and *auth service unreachable*. `verifiedCaller` and
+`verifiedCallerId` keep their old contract (anything but a verified caller is
+`null`). `resolveSubject` in `lib/exams/session.ts` uses the new function and
+sets `ResolvedSubject.denied` to a 401 (token rejected) or a 503 with
+`Retry-After` (auth service down) instead of quietly dealing a guest attempt that
+can never become a certificate. **A route must return `denied` when it is set.**
+`lib/exams/service.ts` must check it after each `resolveSubject` call; until it
+does, behaviour is exactly as before. The guest cookie carries `Secure` on https
+and a malformed cookie value reads as absent instead of throwing.
+
+### BYOK public fields are shape-checked
+
+The non-secret BYOK fields reach vendor SDKs, and the Azure SDK builds an
+endpoint from `location` / `resource_id`. They are now pinned to the vendors'
+formats, in the web layer when stored (`splitCredentialFields`) and again in
+`services/api/app/quantum/credentials.py`, which does not trust its caller:
+Azure location `^[a-z0-9]{3,32}$`, tenant and client ids as GUIDs, the full
+`/subscriptions/<guid>/resourceGroups/<name>/providers/Microsoft.Quantum/Workspaces/<name>`
+resource id, AWS region, S3 bucket and prefix, access key id, and the IBM
+instance. `services/api/app/quantum/azure.py` no longer returns the Azure SDK's
+exception text to the caller (it was reflected in a 400); the caller gets a fixed
+sentence and the real cause is logged. Consequence to know about: a credential
+stored earlier whose public field does not match (for example an Azure tenant
+given as a domain name instead of a GUID) is now refused by the API service at
+use time with "not in the expected format", and its owner must re-save it.
+
+### The BYOK sealing key fallback is loud, not removed
+
+If `SETTINGS_ENCRYPTION_KEY` is unset, credentials are sealed under a key derived
+from `SUPABASE_SERVICE_ROLE_KEY`. Anyone who can read the service-role key can
+decrypt them, and rotating it makes them unreadable. Requiring the explicit key
+would lock out every user whose credential is already stored that way, so the
+fallback stays, with: one `console.warn` and one error-tracker warning per
+process, `byokKeyIsFallback()` in `lib/platform/secretBox.ts` for `/api/health`
+to report to trusted callers, and `open()` still reading values sealed under the
+derived key after the explicit key is set (new seals use the explicit key only).
+The earlier statement in this document that the decryption key "lives only in the
+web app's environment" is true only once `SETTINGS_ENCRYPTION_KEY` is set. Steps:
+docs/BYOK.md, "Moving off the fallback key".
+
+### Rotation note: a lapsed or replaced sealing key
+
+A sealing key is *lapsed* when it is no longer the one the stored values were
+sealed under: `SETTINGS_ENCRYPTION_KEY` replaced with another value, removed
+while the service-role key is the only fallback, or the service-role key rotated
+while the fallback was in use. Nothing re-encrypts. Every value sealed under the
+lapsed key fails to open, `resolveProviderCredential` answers "no credential"
+and logs `could not be decrypted`, and the job runs on the operator's credentials
+rather than the user's, so the symptom is spend on the operator account, not an
+error. Before any rotation: (1) check `byokKeyIsFallback`; (2) if it is `true`,
+set `SETTINGS_ENCRYPTION_KEY` first and do not rotate the service-role key until
+users have re-saved their credentials; (3) if it is `false`, expect to ask each
+user to re-enter their credential after the change; (4) keep the previous key in
+the secret manager until that has happened. The admin-set provider keys in
+`platform_settings` follow the same rule and must be re-entered in
+`/admin/platform`.
+
+## 2026-10-30 follow-up review
+
+An independent review of the audit commit found and fixed: exact measure-all
+results at 11–16 qubits (the new work budgets had silently turned them into
+estimates), a stale step scrubber when frames are capped, the tutor treating
+LangChain's force-stop sentence as an answer, QASM 2 gate towers and QASM 3
+for-loops slipping past the operation ceiling, an empty build stamp freezing the
+service-worker cache name, and a daily-challenge hydration mismatch on
+`/challenges` that appeared after every UTC midnight following a deploy.
+
+Known and deferred:
+
+- `npm audit --omit=dev` reports four low-severity advisories that arrive through
+  `resend` → `@react-email/render` → `html-to-text` → `deepmerge` (prototype
+  poisoning in `mergeObject`). The code path converts our own email templates,
+  not attacker input. The fix is a major bump of `resend` (4 → 6) on the code that
+  sends real mail; do it on its own branch with a live send test.
+- A Free user who re-subscribes on a cancelled row now depends on the Stripe
+  webhook or the post-checkout reconcile on `/account`; the entitlement route no
+  longer re-queries Stripe for cancelled rows.
+- `/api/workbench/evolve` charges one daily model-quota unit per proposal call,
+  so a long run with several providers can exhaust the Free allowance.

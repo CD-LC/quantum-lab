@@ -7,6 +7,7 @@
  */
 
 import { NextResponse } from 'next/server'
+import { NATIVE_SHELL_UA_TOKEN } from '@/lib/app-shell'
 import { APP_URL, getStripe, isStripeConfigured } from '@/lib/billing/stripe'
 import { getServiceSupabase } from '@/lib/billing/entitlements'
 import { isSupabaseConfigured } from '@/lib/supabase'
@@ -40,12 +41,33 @@ interface PortalBody {
   userId?: string
 }
 
+/**
+ * Customer-facing. The operator detail ("set STRIPE_SECRET_KEY…") used to be
+ * the `message`, and the account page renders `message` verbatim — so every
+ * signed-in user on production, where Stripe is deliberately off, read
+ * deployment instructions behind "Manage billing". Operators get `hint`.
+ */
+export const PORTAL_NOT_OPEN =
+  'Billing is not open on this deployment yet, so there is nothing to manage. Your plan and usage above are accurate.'
+
 export async function POST(req: Request): Promise<Response> {
+  // Never from inside the App Store app. The portal is created with plan
+  // changes enabled (docs/BILLING.md §2), so from a store app it is an outside
+  // purchase path for a digital subscription — exactly what App Store guideline
+  // 3.1.1 / Play's payments policy refuse. Same backstop as checkout; the UI
+  // hides the button (lib/app-shell.ts) and this catches whatever it misses.
+  // The Android app is real Chrome and cannot be told apart by user agent.
+  if ((req.headers.get('user-agent') ?? '').includes(NATIVE_SHELL_UA_TOKEN)) {
+    return NextResponse.json(
+      { error: 'Billing is managed on the website, not in the app.', code: 'forbidden' },
+      { status: 403 },
+    )
+  }
   if (!isStripeConfigured) {
     return NextResponse.json({
       configured: false,
-      message:
-        'Billing is not set up in this environment — set STRIPE_SECRET_KEY to enable the customer portal. See docs/BILLING.md.',
+      message: PORTAL_NOT_OPEN,
+      hint: 'Set STRIPE_SECRET_KEY to enable the customer portal. See docs/BILLING.md.',
     })
   }
 
@@ -78,8 +100,8 @@ export async function POST(req: Request): Promise<Response> {
   if (!isSupabaseConfigured) {
     return NextResponse.json({
       configured: false,
-      message:
-        'No database is configured, so there is no stored Stripe customer to open a portal for.',
+      message: PORTAL_NOT_OPEN,
+      hint: 'No database is configured, so there is no stored Stripe customer to open a portal for.',
     })
   }
 
@@ -98,8 +120,8 @@ export async function POST(req: Request): Promise<Response> {
     if (!supabase) {
       return NextResponse.json({
         configured: false,
-        message:
-          'SUPABASE_SERVICE_ROLE_KEY is not set, so the stored Stripe customer id cannot be read.',
+        message: PORTAL_NOT_OPEN,
+        hint: 'SUPABASE_SERVICE_ROLE_KEY is not set, so the stored Stripe customer id cannot be read.',
       })
     }
 
@@ -137,7 +159,8 @@ export async function POST(req: Request): Promise<Response> {
     if (!stripe) {
       return NextResponse.json({
         configured: false,
-        message: 'Stripe could not be initialised — check STRIPE_SECRET_KEY.',
+        message: PORTAL_NOT_OPEN,
+        hint: 'Stripe could not be initialised — check STRIPE_SECRET_KEY.',
       })
     }
 

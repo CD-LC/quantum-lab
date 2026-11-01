@@ -37,7 +37,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
 import { authFetch } from '@/lib/authFetch'
-import { formatClock, isAnswered, remainingMs } from '@/lib/exams/clock'
+import { clockOffsetMs, formatClock, isAnswered, remainingMs } from '@/lib/exams/clock'
 // A11Y: the countdown is deliberately NOT a live region (see the threshold
 // effect below) — a per-second announcement makes the paper unusable. Thresholds
 // and the auto-submit are announced through the shared live regions instead.
@@ -100,6 +100,13 @@ export function ExamRunner({ exam }: ExamRunnerProps) {
   const [phase, setPhase] = useState<Phase>('loading')
   const [index, setIndex] = useState(0)
   const [now, setNow] = useState(() => Date.now())
+  /**
+   * How far this device's clock is ahead of the server's (ms), measured once
+   * per adopt from the attempt's `serverNow`. Every countdown below uses
+   * `now - clockOffset`, so a skewed system clock cannot shorten or lengthen
+   * the sitting relative to the deadline the server enforces.
+   */
+  const [clockOffset, setClockOffset] = useState(0)
   const [locked, setLocked] = useState<LockedInfo | null>(null)
   const [durable, setDurable] = useState(true)
   const [notice, setNotice] = useState<string | null>(null)
@@ -154,6 +161,8 @@ export function ExamRunner({ exam }: ExamRunnerProps) {
     if (state === 'open') {
       const open = body.attempt as ClientAttempt
       answersRef.current = open.answers ?? {}
+      setClockOffset(clockOffsetMs(open.serverNow, Date.now()))
+      setNow(Date.now())
       setAttempt(open)
       setPaper((body.paper as PaperQuestion[]) ?? [])
       setResult(null)
@@ -315,7 +324,7 @@ export function ExamRunner({ exam }: ExamRunnerProps) {
     return () => window.clearInterval(timer)
   }, [phase])
 
-  const left = attempt ? remainingMs(attempt.expiresAt, now) : 0
+  const left = attempt ? remainingMs(attempt.expiresAt, now - clockOffset) : 0
 
   useEffect(() => {
     if (!attempt) return

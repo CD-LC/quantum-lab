@@ -123,7 +123,9 @@ Input:
 ```
 
 `shots` is clamped to 1–4096 (default 1024); `seed` is optional and makes the
-sampling reproducible. Registers are capped at 16 qubits. Supported gates:
+sampling reproducible. Registers are capped at 16 qubits, and a circuit is
+capped at **1,000 gates** (see [Circuit size limits](#circuit-size-limits)).
+Supported gates:
 `h x y z s sdg t tdg sx sxdg rx ry rz p cx cy cz swap ccx cswap` (controls
 listed first), plus `ctrl(n) @ x …` for a multi-controlled X, `barrier`, a
 custom unitary declared as a `gate` definition, and the register blocks the
@@ -152,6 +154,17 @@ Amplitudes with magnitude below 1e-10 are omitted and counted in
 `omittedNearZeroAmplitudes`, so a 16-qubit reply stays kilobytes, not
 megabytes, and "sparse" is distinguishable from "missing".
 
+**Measurement.** `counts` come from the exact output distribution. Measuring
+qubits at the end of the circuit (the usual "measure every qubit") is always
+exact at every size up to 16 qubits, and so is a circuit with a moderate amount
+of mid-circuit measurement, reset or classically controlled gates. Only when
+that branching is too large to enumerate does the tool fall back to an
+estimate averaged over sampled trajectories; the reply then carries
+`"approximate": true`, `trajectories` (how many were averaged) and an
+`approximationNote`. The fields are absent from an exact result. The
+`statevector` of a circuit with mid-circuit measurement is one measurement
+trajectory (not the mixture), the same one `get_statevector_at_step` follows.
+
 ### `get_statevector_at_step`
 
 The step-through inspector's engine: the state **after step N**, where step 0
@@ -162,7 +175,27 @@ entanglement appear gate by gate.
 Input: `{ "qasm": "…", "step": 1 }` · Output adds `step`, `totalSteps`,
 `appliedGate` (`null` at step 0), `statevector` (same sparse shape as above),
 and `blochVectors: [{ qubit, x, y, z, entanglementEntropy }]`. An out-of-range
-step is an error naming the valid range.
+step is an error naming the valid range. The circuit is capped at 1,000 gates
+(see [Circuit size limits](#circuit-size-limits)). For a circuit with
+measurement or classical control, step N is a prefix of the same measurement
+trajectory `run_circuit` reports in its `statevector`, so the last step equals
+that statevector.
+
+### Circuit size limits
+
+Every tool that takes a `qasm` argument and simulates, exports or submits it —
+`run_circuit`, `get_statevector_at_step`, `export_notebook`,
+`submit_hardware_job` and the experiment tool `run_step` — rejects a circuit
+that parses to more than **1,000 gates** before doing any work. The tool error
+reads:
+
+> This circuit has 1200 gates; the ceiling is 1000. Split it into shorter
+> circuits or drop the repeated section.
+
+(with the actual gate count). `submit_hardware_job` applies this ceiling in
+addition to the hardware route's own limits, which are checked afterwards.
+The 16-qubit register cap has its own message, and a QASM text over the size
+cap is rejected as too long.
 
 ### `list_challenges`
 
@@ -491,7 +524,15 @@ already public or free.
 
 - Simulation (`run_circuit`, `get_statevector_at_step`) is deterministic,
   local CPU work — no money is spent, no state is written, and the cost per
-  request is bounded by the 16-qubit / 4 096-shot clamps plus the rate limits.
+  request is bounded by the 16-qubit / 4 096-shot / 1 000-gate clamps plus the
+  rate limits.
+- An unexpected failure inside a tool is reported to observability and **not**
+  echoed to the caller: the reply is the generic `Tool "<name>" failed; try
+  again later.` with `isError: true`, because a raw exception message on an
+  anonymous surface can carry provider, host or table detail. Tools that have
+  something actionable to say (an out-of-range step, an impossible
+  postselection, a circuit over a limit) return their own specific error
+  instead.
 - The challenge catalogue, generator, and grader are the same code that runs,
   ungated, in every visitor's browser tab. Generated challenges are pure
   functions of `(kind, difficulty, seed)` — no server state, nothing to leak.

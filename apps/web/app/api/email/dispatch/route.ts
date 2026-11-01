@@ -35,13 +35,13 @@
  */
 
 import { NextResponse } from 'next/server'
-import { timingSafeEqual } from 'node:crypto'
 import { isEmailConfigured } from '@/lib/email/client'
 import { runCourseDispatch } from '@/lib/email/courseDispatch'
 import {
   SubscriptionStoreUnavailableError,
   getSubscriptionStore,
 } from '@/lib/email/subscriptions'
+import { secretMatches } from '@/lib/billing/secretCompare'
 import { APP_URL } from '@/lib/billing/stripe'
 import { callerKey, rateLimit, retryAfterHeaders } from '@/lib/rateLimit'
 import { isRecord, safeJson } from '@/lib/security/validate'
@@ -50,15 +50,25 @@ import { apiError, badRequest } from '@/lib/apiError'
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
-/** Batch bounds: one call never fans out unboundedly against the provider. */
-const DEFAULT_LIMIT = 25
+/**
+ * Batch bounds: one call never fans out unboundedly against the provider.
+ *
+ * The store lists only subscribers with a day actually due (courseDueFilter in
+ * lib/email/courseDispatch.ts), so `limit` is a ceiling on MESSAGES per pass,
+ * not on rows glanced at. The default is the maximum because the hourly cron
+ * (infra/azure/email-cron/dispatch.sh) posts no body: with 25, a surge of 26
+ * confirmations in one hour needs a further pass to clear, and an idle pass
+ * costs the same whatever the ceiling.
+ */
+const DEFAULT_LIMIT = 100
 const MAX_LIMIT = 100
 
 /**
  * Read per request, not at module scope, so tests can exercise both the
  * unset-secret and wrong-secret refusals without module-cache games. The
- * comparison itself follows /api/billing/reconcile: length check first
- * (timingSafeEqual throws on unequal lengths), then constant-time equality.
+ * comparison itself follows /api/billing/reconcile: SHA-256 digests of both
+ * sides, then constant-time equality (lib/billing/secretCompare.ts), so a
+ * multi-byte character in the header cannot make it throw.
  */
 function presentsDispatchSecret(req: Request): boolean {
   const secret = (process.env.EMAIL_DISPATCH_SECRET ?? '').trim()
@@ -66,8 +76,7 @@ function presentsDispatchSecret(req: Request): boolean {
   const header = (req.headers.get('authorization') ?? '').trim()
   if (!header.toLowerCase().startsWith('bearer ')) return false
   const offered = header.slice('bearer '.length).trim()
-  if (offered.length !== secret.length) return false
-  return timingSafeEqual(Buffer.from(offered), Buffer.from(secret))
+  return secretMatches(offered, secret)
 }
 
 export async function POST(req: Request): Promise<NextResponse> {

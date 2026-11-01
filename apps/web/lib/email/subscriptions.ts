@@ -63,6 +63,13 @@ export interface SubscriptionRecord {
   consentedAt: string
   confirmedAt: string | null
   unsubscribedAt: string | null
+  /**
+   * Course days already claimed for sending — the sent_days column, owned by
+   * the dispatcher (courseDispatch.ts). Carried here so that a REPLACED row
+   * (re-signup after an unsubscribe or an abandoned signup) starts the course
+   * again from day 1: a fresh consent is a fresh course, not a resumption.
+   */
+  sentDays: number[]
 }
 
 // ── token minting and hashing ───────────────────────────────────────────────
@@ -160,6 +167,12 @@ interface SubscriptionRow {
   consented_at: string
   confirmed_at: string | null
   unsubscribed_at: string | null
+  sent_days: unknown
+}
+
+/** int[] arrives as number[]; anything else (an old row, hand edits) reads as "nothing sent". */
+function readSentDays(value: unknown): number[] {
+  return Array.isArray(value) ? value.filter((d): d is number => Number.isInteger(d)) : []
 }
 
 function rowToRecord(row: SubscriptionRow): SubscriptionRecord {
@@ -175,9 +188,19 @@ function rowToRecord(row: SubscriptionRow): SubscriptionRecord {
     consentedAt: row.consented_at,
     confirmedAt: row.confirmed_at,
     unsubscribedAt: row.unsubscribed_at,
+    sentDays: readSentDays(row.sent_days),
   }
 }
 
+/**
+ * CORRECTNESS FIX: sent_days is written too. It used to be left out, so the
+ * upsert that REPLACES an unsubscribed row on re-signup kept the old send
+ * record: a learner who left after day 4 and came back was served day 5
+ * first, and one who had finished the course was excluded by the dispatcher
+ * for ever — confirmed, told they were signed up, and sent nothing.
+ * course_unsubscribe_token is deliberately NOT here: it stays as it was, so
+ * the unsubscribe link in any already-delivered mail keeps working.
+ */
 function recordToRow(record: SubscriptionRecord): SubscriptionRow {
   return {
     id: record.id,
@@ -187,6 +210,7 @@ function recordToRow(record: SubscriptionRecord): SubscriptionRow {
     consented_at: record.consentedAt,
     confirmed_at: record.confirmedAt,
     unsubscribed_at: record.unsubscribedAt,
+    sent_days: record.sentDays,
   }
 }
 
@@ -269,8 +293,9 @@ export type SignupOutcome =
  * Record a signup and mint the token for its confirm mail.
  *
  * A repeat signup for an unconfirmed or unsubscribed row REPLACES the row:
- * new token, new consentedAt, confirmation and opt-out reset. That is the
- * only path back in after an unsubscribe, and it goes through a fresh
+ * new token, new consentedAt, confirmation and opt-out reset, and the course
+ * send record (sentDays) emptied so the course starts again at day 1. That
+ * is the only path back in after an unsubscribe, and it goes through a fresh
  * double-opt-in — the old row's state never silently becomes consent.
  *
  * An already-confirmed, not-unsubscribed row gets NO new mail: otherwise this
@@ -301,6 +326,7 @@ export async function beginSubscription(
     consentedAt: new Date().toISOString(),
     confirmedAt: null,
     unsubscribedAt: null,
+    sentDays: [],
   })
   return { kind: 'send-confirm', token }
 }
